@@ -1,0 +1,37 @@
+---
+# =============================================================================
+# handlers/main.yml
+# Handlers are triggered by "notify:" directives in task files. They run
+# exactly once at the end of the play (or when explicitly flushed), even if
+# notified multiple times — preventing redundant service restarts.
+# =============================================================================
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+  listen: Reload systemd daemon
+
+- name: Start Xray service
+  ansible.builtin.systemd:
+    name: "{{ xray_service_name }}"
+    state: started
+    enabled: true
+  listen: Start Xray service
+
+- name: Restart Xray service
+  ansible.builtin.systemd:
+    name: "{{ xray_service_name }}"
+    state: restarted
+    enabled: true
+  listen: Restart Xray service
+
+- name: Restore SELinux file contexts
+  ansible.builtin.command:
+    # restorecon applies the file context rules registered by sefcontext tasks
+    cmd: >-
+      restorecon -Rv
+      {{ xray_install_dir }}
+      {{ xray_data_dir }}
+      {{ xray_log_dir }}
+  changed_when: true
+  listen: Restore SELinux file contexts

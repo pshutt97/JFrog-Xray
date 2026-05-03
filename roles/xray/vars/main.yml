@@ -1,0 +1,60 @@
+---
+# =============================================================================
+# Role vars – higher precedence than defaults; treat as "internal constants".
+# Values here are generally not meant to be overridden externally.
+# =============================================================================
+
+# Minimum hardware requirements (used in preflight assertions)
+xray_min_cpu_count: 4
+xray_min_ram_mb: 8192        # 8 GB minimum; 16 GB recommended for production
+
+# Required OS packages (RHEL 9 / DNF)
+xray_required_packages:
+  - curl
+  - wget
+  - tar
+  - gzip
+  - net-tools
+  - lsof
+  - openssl
+  - ca-certificates
+  - policycoreutils-python-utils   # Required for semanage (SELinux)
+  - firewalld
+
+# SELinux file contexts that must be applied to Xray directories
+xray_selinux_fcontexts:
+  - { path: "{{ xray_install_dir }}(/.*)?", type: "bin_t" }
+  - { path: "{{ xray_data_dir }}(/.*)?",    type: "var_t" }
+  - { path: "{{ xray_log_dir }}(/.*)?",     type: "var_log_t" }
+
+# Systemd drop-in limits (LimitNOFILE etc.)
+xray_systemd_dropin_dir: "/etc/systemd/system/{{ xray_service_name }}.service.d"
+
+# JFrog installer script paths (relative to the extracted tarball)
+xray_installer_script: "installXray.sh"
+xray_installer_upgrade_script: "upgradeXray.sh"
+
+# Derived download URL (used when xray_use_local_mirror is false)
+_xray_download_url_default: >-
+  {{ xray_download_base_url }}/{{ xray_version }}/{{ xray_installer_archive }}
+
+# Resolved download URL (mirror or official)
+xray_download_url: >-
+  {{
+    (xray_local_mirror_base_url ~ '/' ~ xray_installer_archive)
+    if xray_use_local_mirror
+    else _xray_download_url_default | trim
+  }}
+
+# Map of directories that must be created with correct ownership/permissions
+xray_managed_directories:
+  - path: "{{ xray_install_dir }}"
+    mode: "0755"
+  - path: "{{ xray_data_dir }}"
+    mode: "0750"
+  - path: "{{ xray_log_dir }}"
+    mode: "0750"
+  - path: "{{ xray_installer_dir }}"
+    mode: "0755"
+  - path: "{{ xray_upgrade_backup_dir }}"
+    mode: "0750"

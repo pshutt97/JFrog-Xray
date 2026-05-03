@@ -1,0 +1,16 @@
+---
+# =============================================================================
+# requirements.yml – Ansible Galaxy collection dependencies
+# =============================================================================
+# Install all dependencies with:
+#   ansible-galaxy collection install -r requirements.yml
+# =============================================================================
+
+collections:
+  # ansible.posix: provides firewalld, sysctl, seboolean, synchronize modules
+  - name: ansible.posix
+    version: ">=1.5.4"
+
+  # community.general: provides pam_limits, sefcontext, and many other utilities
+  - name: community.general
+    version: ">=7.0.0"

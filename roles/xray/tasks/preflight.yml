@@ -1,0 +1,133 @@
+---
+# =============================================================================
+# tasks/preflight.yml
+# Pre-flight validation: hardware, connectivity, and dependency checks.
+# All assertions use fail_msg/success_msg so failures are immediately clear.
+# =============================================================================
+
+- name: "[PREFLIGHT] Assert minimum CPU count"
+  ansible.builtin.assert:
+    that: ansible_processor_vcpus >= xray_min_cpu_count
+    fail_msg: >-
+      Insufficient vCPUs: {{ ansible_processor_vcpus }} detected,
+      {{ xray_min_cpu_count }} required. Xray will perform poorly below this threshold.
+    success_msg: "CPU check passed: {{ ansible_processor_vcpus }} vCPUs available."
+
+- name: "[PREFLIGHT] Assert minimum RAM"
+  ansible.builtin.assert:
+    that: ansible_memtotal_mb >= xray_min_ram_mb
+    fail_msg: >-
+      Insufficient RAM: {{ ansible_memtotal_mb }} MB detected,
+      {{ xray_min_ram_mb }} MB required.
+    success_msg: "RAM check passed: {{ ansible_memtotal_mb }} MB available."
+
+- name: "[PREFLIGHT] Assert sufficient disk space on install dir parent"
+  ansible.builtin.assert:
+    that: >-
+      (ansible_mounts
+        | selectattr('mount', 'in', [xray_install_dir, '/opt', '/'])
+        | map(attribute='size_available')
+        | list | first | default(0)) >= 10737418240
+    fail_msg: "Insufficient disk space on mount hosting {{ xray_install_dir }}. Need >= 10 GB free."
+    success_msg: "Disk space check passed."
+
+- name: "[PREFLIGHT] Check required ports are not already in use by another process"
+  ansible.builtin.wait_for:
+    port: "{{ item }}"
+    state: stopped          # 'stopped' means the port is FREE (not listening)
+    timeout: 5
+  loop:
+    - "{{ xray_http_port }}"
+    - "{{ xray_grpc_port }}"
+    - "{{ xray_router_port }}"
+  when: xray_action == 'install'   # Skip during upgrade – Xray already owns these ports
+  ignore_errors: false
+
+- name: "[PREFLIGHT] Verify JFrog Platform (Artifactory) is reachable"
+  ansible.builtin.uri:
+    url: "{{ jfrog_platform_url }}/artifactory/api/system/ping"
+    method: GET
+    status_code: 200
+    timeout: 15
+    validate_certs: true
+  register: artifactory_ping
+  retries: 3
+  delay: 10
+  until: artifactory_ping.status == 200
+  failed_when: artifactory_ping.status != 200
+
+- name: "[PREFLIGHT] Verify database host is reachable"
+  ansible.builtin.wait_for:
+    host: "{{ xray_db_host }}"
+    port: "{{ xray_db_port }}"
+    state: started
+    timeout: 10
+  when: not xray_rabbitmq_bundled or xray_db_host != 'localhost'
+
+- name: "[PREFLIGHT] Detect existing Xray installation"
+  ansible.builtin.stat:
+    path: "{{ xray_install_dir }}/app/bin/xray"
+  register: xray_binary_stat
+
+- name: "[PREFLIGHT] Determine installed version (if any)"
+  ansible.builtin.command:
+    cmd: "{{ xray_install_dir }}/app/bin/xray --version"
+  register: xray_installed_version_raw
+  changed_when: false
+  failed_when: false
+  when: xray_binary_stat.stat.exists
+
+- name: "[PREFLIGHT] Set installed_version fact"
+  ansible.builtin.set_fact:
+    xray_installed_version: >-
+      {{ xray_installed_version_raw.stdout
+         | regex_search('(\\d+\\.\\d+\\.\\d+)')
+         | default('none') }}
+  when: xray_binary_stat.stat.exists
+
+- name: "[PREFLIGHT] Set installed_version fact when Xray is not installed"
+  ansible.builtin.set_fact:
+    xray_installed_version: "none"
+  when: not xray_binary_stat.stat.exists
+
+- name: "[PREFLIGHT] Abort if 'install' requested but Xray is already installed"
+  ansible.builtin.assert:
+    that: not xray_binary_stat.stat.exists
+    fail_msg: >-
+      Xray {{ xray_installed_version }} is already installed at {{ xray_install_dir }}.
+      Use xray_action=upgrade to perform an in-place upgrade.
+    success_msg: "Install path is clear – no existing installation detected."
+  when: xray_action == 'install'
+
+- name: "[PREFLIGHT] Abort if 'upgrade' requested but Xray is NOT installed"
+  ansible.builtin.assert:
+    that: xray_binary_stat.stat.exists
+    fail_msg: >-
+      xray_action=upgrade was requested but no existing Xray installation was found
+      at {{ xray_install_dir }}. Run with xray_action=install first.
+    success_msg: "Existing installation confirmed at {{ xray_install_dir }}."
+  when: xray_action == 'upgrade'
+
+- name: "[PREFLIGHT] Warn if target version is the same as installed version"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠ WARNING: Requested version {{ xray_version }} matches the currently installed
+      version {{ xray_installed_version }}. The upgrade will proceed but may be a no-op.
+  when:
+    - xray_action == 'upgrade'
+    - xray_installed_version == xray_version
+
+- name: "[PREFLIGHT] Display summary"
+  ansible.builtin.debug:
+    msg:
+      - "=== JFrog Xray Pre-flight Summary ==="
+      - "Host            : {{ inventory_hostname }}"
+      - "Action          : {{ xray_action }}"
+      - "Target version  : {{ xray_version }}"
+      - "Installed version: {{ xray_installed_version }}"
+      - "vCPUs           : {{ ansible_processor_vcpus }}"
+      - "RAM (MB)        : {{ ansible_memtotal_mb }}"
+      - "Install dir     : {{ xray_install_dir }}"
+      - "Data dir        : {{ xray_data_dir }}"
+      - "DB host         : {{ xray_db_host }}:{{ xray_db_port }}"
+      - "RabbitMQ bundled: {{ xray_rabbitmq_bundled }}"

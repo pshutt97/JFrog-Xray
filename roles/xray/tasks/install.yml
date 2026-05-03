@@ -1,0 +1,125 @@
+---
+# =============================================================================
+# tasks/install.yml
+# Fresh installation of JFrog Xray.
+# Only reached when xray_action == 'install' AND preflight confirms no
+# existing installation exists.
+# =============================================================================
+
+# ── 1. Download installer archive ────────────────────────────────────────────
+
+- name: "[INSTALL] Download Xray installer archive"
+  ansible.builtin.get_url:
+    url: "{{ xray_download_url }}"
+    dest: "{{ xray_installer_dir }}/{{ xray_installer_archive }}"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode: "0640"
+    # Use checksum if the operator has provided one; omit to skip verification.
+    # checksum: "{{ xray_installer_checksum_algo }}:{{ xray_installer_checksum }}"
+    timeout: 300
+  register: xray_download_result
+  retries: 3
+  delay: 15
+  until: xray_download_result is succeeded
+  environment:
+    http_proxy: "{{ xray_http_proxy | default(omit) }}"
+    https_proxy: "{{ xray_https_proxy | default(omit) }}"
+    no_proxy: "{{ xray_no_proxy | default(omit) }}"
+
+# ── 2. Extract archive ───────────────────────────────────────────────────────
+
+- name: "[INSTALL] Extract Xray installer archive"
+  ansible.builtin.unarchive:
+    src: "{{ xray_installer_dir }}/{{ xray_installer_archive }}"
+    dest: "{{ xray_installer_dir }}"
+    remote_src: true
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    creates: "{{ xray_installer_dir }}/xray-{{ xray_version }}"
+
+- name: "[INSTALL] Set extracted installer directory fact"
+  ansible.builtin.set_fact:
+    xray_extracted_dir: "{{ xray_installer_dir }}/xray-{{ xray_version }}"
+
+- name: "[INSTALL] Ensure installer script is executable"
+  ansible.builtin.file:
+    path: "{{ xray_extracted_dir }}/{{ xray_installer_script }}"
+    mode: "0755"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+
+# ── 3. Prepare installer response/config file ────────────────────────────────
+# The installer accepts answers via a YAML config file, avoiding interactive prompts.
+
+- name: "[INSTALL] Write installer config (system.yaml) from template"
+  ansible.builtin.template:
+    src: system.yaml.j2
+    dest: "{{ xray_extracted_dir }}/system.yaml"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode: "0640"
+
+# ── 4. Run the installer ─────────────────────────────────────────────────────
+# The JFrog installer script reads system.yaml from the same directory when
+# invoked with '--standalone-full' and '--config <path>'.
+
+- name: "[INSTALL] Execute Xray installer"
+  ansible.builtin.command:
+    cmd: >-
+      {{ xray_extracted_dir }}/{{ xray_installer_script }}
+      --standalone-full
+      --install-dir {{ xray_install_dir }}
+      --data-dir    {{ xray_data_dir }}
+      --log-dir     {{ xray_log_dir }}
+      --service-user {{ xray_system_user }}
+      --config      {{ xray_extracted_dir }}/system.yaml
+    creates: "{{ xray_install_dir }}/app/bin/xray"
+  become_user: root
+  register: xray_install_result
+  notify:
+    - Reload systemd daemon
+    - Start Xray service
+
+- name: "[INSTALL] Display installer output"
+  ansible.builtin.debug:
+    var: xray_install_result.stdout_lines
+  when: xray_install_result.stdout_lines is defined
+
+# ── 5. Post-install file permission hardening ────────────────────────────────
+
+- name: "[INSTALL] Restrict permissions on Xray configuration directory"
+  ansible.builtin.file:
+    path: "{{ xray_install_dir }}/var/etc"
+    state: directory
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode: "0750"
+    recurse: false
+
+- name: "[INSTALL] Restrict permissions on Xray secrets/keys directory"
+  ansible.builtin.file:
+    path: "{{ xray_install_dir }}/var/etc/security"
+    state: directory
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode: "0700"
+    recurse: false
+
+# ── 6. Verify binary is present ──────────────────────────────────────────────
+
+- name: "[INSTALL] Verify Xray binary exists after installation"
+  ansible.builtin.stat:
+    path: "{{ xray_install_dir }}/app/bin/xray"
+  register: xray_bin_stat_post
+  failed_when: not xray_bin_stat_post.stat.exists
+
+- name: "[INSTALL] Confirm installed version"
+  ansible.builtin.command:
+    cmd: "{{ xray_install_dir }}/app/bin/xray --version"
+  register: xray_version_confirm
+  changed_when: false
+
+- name: "[INSTALL] Display confirmed version"
+  ansible.builtin.debug:
+    msg: "✔ JFrog Xray installed: {{ xray_version_confirm.stdout | trim }}"

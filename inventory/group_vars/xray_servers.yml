@@ -1,0 +1,85 @@
+---
+# =============================================================================
+# Group-level variables for [xray_servers]
+# These layer on top of role defaults and can be overridden per-host in
+# inventory/host_vars/<hostname>.yml or at the CLI with -e.
+# =============================================================================
+
+# --- Version & source ---
+xray_version: "3.88.9"
+xray_action: "install"          # install | upgrade | configure
+
+# --- Installation paths ---
+xray_install_dir: /opt/jfrog/xray
+xray_data_dir: /var/opt/jfrog/xray
+xray_log_dir: /var/log/jfrog/xray
+xray_installer_dir: /opt/jfrog/installers
+
+# --- JFrog Platform (Artifactory) connectivity ---
+# Xray must be joined to a JFrog Platform Deployment (JPD / Artifactory).
+jfrog_platform_url: "https://artifactory.example.com"
+jfrog_platform_admin_user: "admin"
+# Store the admin token in Ansible Vault – never in plain text!
+# jfrog_platform_admin_token: "{{ vault_jfrog_admin_token }}"
+
+# --- Database (PostgreSQL) ---
+xray_db_type: "postgresql"
+xray_db_host: "postgres.example.com"
+xray_db_port: 5432
+xray_db_name: "xraydb"
+xray_db_user: "xray"
+# Store password in Ansible Vault:
+# xray_db_password: "{{ vault_xray_db_password }}"
+
+# --- RabbitMQ (bundled vs external) ---
+xray_rabbitmq_bundled: true     # Set false to use an external RabbitMQ cluster
+# xray_rabbitmq_host: "rabbitmq.example.com"
+# xray_rabbitmq_port: 5672
+# xray_rabbitmq_user: "xray"
+# xray_rabbitmq_password: "{{ vault_xray_rmq_password }}"
+
+# --- Network ---
+xray_http_port: 8000
+xray_grpc_port: 7777
+xray_router_port: 8082
+
+# --- System resource limits ---
+xray_open_files_limit: 32000
+xray_max_map_count: 262144
+
+# --- Systemd service name ---
+xray_service_name: "xray"
+
+# --- Download configuration ---
+# Toggle to use a local mirror / Artifactory Generic repo instead of downloads.jfrog.io
+xray_use_local_mirror: false
+xray_local_mirror_base_url: "https://artifactory.example.com/artifactory/jfrog-installers"
+
+# --- Upgrade behaviour ---
+xray_upgrade_backup: true           # Take a snapshot of data dir before upgrade
+xray_upgrade_backup_dir: /opt/jfrog/backups
+xray_upgrade_drain_timeout: 120     # Seconds to wait for in-flight scans to finish
+
+# --- Security ---
+xray_create_system_user: true
+xray_system_user: xray
+xray_system_group: xray
+xray_system_user_uid: 1050
+xray_system_user_gid: 1050
+xray_system_user_shell: /sbin/nologin
+
+# --- SELinux ---
+xray_configure_selinux: true        # Apply required SELinux booleans & file contexts
+
+# --- Firewalld ---
+xray_configure_firewall: true
+xray_firewall_zone: "public"
+
+# --- Proxy (optional) ---
+xray_http_proxy: ""
+xray_https_proxy: ""
+xray_no_proxy: "localhost,127.0.0.1,.example.com"
+
+# --- Feature flags ---
+xray_enable_vuln_db_sync: true      # Periodically sync the JFrog vulnerability database
+xray_enable_watches: true           # Enable Xray Watch/Policy enforcement

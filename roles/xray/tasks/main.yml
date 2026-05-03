@@ -1,0 +1,35 @@
+---
+# =============================================================================
+# tasks/main.yml – Orchestration entry point
+# Routes execution to the appropriate sub-task file based on xray_action.
+# The order of the includes below reflects the logical dependency chain:
+#   preflight → system prep → install/upgrade → configure → service
+# =============================================================================
+
+- name: Run preflight checks
+  ansible.builtin.import_tasks: preflight.yml
+  tags: [xray, preflight]
+
+- name: Prepare system (users, dirs, packages, tuning)
+  ansible.builtin.import_tasks: system_prep.yml
+  tags: [xray, system_prep]
+
+# ---- Action routing -------------------------------------------------------
+- name: Execute INSTALL workflow
+  ansible.builtin.import_tasks: install.yml
+  when: xray_action == 'install'
+  tags: [xray, install]
+
+- name: Execute UPGRADE workflow
+  ansible.builtin.import_tasks: upgrade.yml
+  when: xray_action == 'upgrade'
+  tags: [xray, upgrade]
+# ---------------------------------------------------------------------------
+
+- name: Apply Xray configuration
+  ansible.builtin.import_tasks: configure.yml
+  tags: [xray, configure]
+
+- name: Manage Xray systemd service
+  ansible.builtin.import_tasks: service.yml
+  tags: [xray, service]

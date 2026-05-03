@@ -1,0 +1,91 @@
+---
+# =============================================================================
+# tasks/configure.yml
+# Applies and reconciles Xray runtime configuration.
+# This runs after both installs and upgrades, and can also be invoked
+# standalone (xray_action=configure) to converge configuration drift.
+#
+# Configuration is managed through two key files:
+#   - system.yaml  : JFrog Platform-level config (DB, RabbitMQ, ports, etc.)
+#   - xray.config.yaml : Xray-specific behavioural settings
+# =============================================================================
+
+# ── 1. Deploy system.yaml ────────────────────────────────────────────────────
+# system.yaml is the primary JFrog Platform configuration file.
+# It is placed in $JFROG_HOME/xray/var/etc/system.yaml.
+
+- name: "[CONFIGURE] Deploy system.yaml from template"
+  ansible.builtin.template:
+    src: system.yaml.j2
+    dest: "{{ xray_install_dir }}/var/etc/system.yaml"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode: "0640"
+    backup: true
+  notify: Restart Xray service
+
+# ── 2. Deploy xray.config.yaml ───────────────────────────────────────────────
+
+- name: "[CONFIGURE] Deploy xray.config.yaml from template"
+  ansible.builtin.template:
+    src: xray.config.yaml.j2
+    dest: "{{ xray_install_dir }}/var/etc/xray/xray.config.yaml"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode: "0640"
+    backup: true
+  notify: Restart Xray service
+
+# ── 3. Set logrotate for Xray logs ───────────────────────────────────────────
+
+- name: "[CONFIGURE] Install logrotate configuration for Xray"
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/jfrog-xray
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible – JFrog Xray log rotation
+      {{ xray_log_dir }}/*.log {
+          daily
+          rotate 14
+          compress
+          delaycompress
+          missingok
+          notifempty
+          sharedscripts
+          postrotate
+              systemctl kill -s HUP {{ xray_service_name }} 2>/dev/null || true
+          endscript
+      }
+
+# ── 4. Verify configuration is syntactically valid ───────────────────────────
+# Xray ships a 'verify' or 'check-config' CLI sub-command in newer versions.
+# We use a simple YAML-lint approach as a portable fallback.
+
+- name: "[CONFIGURE] Verify system.yaml is parseable YAML"
+  ansible.builtin.command:
+    cmd: "python3 -c \"import yaml,sys; yaml.safe_load(open('{{ xray_install_dir }}/var/etc/system.yaml'))\""
+  changed_when: false
+  register: yaml_check
+  failed_when: yaml_check.rc != 0
+
+- name: "[CONFIGURE] Verify xray.config.yaml is parseable YAML"
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c
+      "import yaml,sys; yaml.safe_load(open('{{ xray_install_dir }}/var/etc/xray/xray.config.yaml'))"
+  changed_when: false
+  register: xray_config_yaml_check
+  failed_when: xray_config_yaml_check.rc != 0
+
+# ── 5. Ownership reconciliation ───────────────────────────────────────────────
+# Ensure that file permissions haven't drifted, especially after manual edits.
+
+- name: "[CONFIGURE] Reconcile ownership on Xray var directory"
+  ansible.builtin.file:
+    path: "{{ xray_install_dir }}/var"
+    state: directory
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    recurse: true

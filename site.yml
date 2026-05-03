@@ -1,0 +1,82 @@
+---
+# =============================================================================
+# JFrog Xray – Site-level entry playbook
+# =============================================================================
+# Usage:
+#   Install  : ansible-playbook site.yml -e "xray_action=install"
+#   Upgrade  : ansible-playbook site.yml -e "xray_action=upgrade"
+#   Configure: ansible-playbook site.yml -e "xray_action=configure"
+#
+# Override any defaults from roles/xray/defaults/main.yml at the CLI:
+#   ansible-playbook site.yml -e "xray_version=3.88.9 xray_action=upgrade"
+# =============================================================================
+
+- name: Validate controller prerequisites
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Assert Ansible version is 2.14 or higher
+      ansible.builtin.assert:
+        that: ansible_version.full is version('2.14', '>=')
+        fail_msg: "Ansible >= 2.14 is required. Found: {{ ansible_version.full }}"
+        success_msg: "Ansible version check passed: {{ ansible_version.full }}"
+
+    - name: Assert a valid xray_action was provided
+      ansible.builtin.assert:
+        that: xray_action in ['install', 'upgrade', 'configure']
+        fail_msg: >-
+          Invalid xray_action='{{ xray_action | default('undefined') }}'.
+          Must be one of: install, upgrade, configure.
+      vars:
+        xray_action: "{{ xray_action | default('install') }}"
+
+- name: JFrog Xray – provision target hosts
+  hosts: xray_servers
+  become: true
+  gather_facts: true
+  any_errors_fatal: false    # Allows other hosts to proceed if one fails
+  serial: "{{ xray_serial | default('1') }}"   # Rolling upgrade safety
+
+  vars:
+    xray_action: "{{ xray_action | default('install') }}"
+
+  pre_tasks:
+    - name: Verify target OS is RHEL / Rocky / AlmaLinux 9
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "RedHat"
+          - ansible_distribution_major_version == "9"
+        fail_msg: >-
+          Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+          This playbook targets RHEL-family 9.x only.
+        success_msg: "OS check passed: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+      tags: [always, preflight]
+
+    - name: Collect pre-run Xray service state (if present)
+      ansible.builtin.systemd:
+        name: "{{ xray_service_name }}"
+      register: xray_pre_state
+      failed_when: false
+      changed_when: false
+      tags: [always]
+
+  roles:
+    - role: xray
+      tags: [xray]
+
+  post_tasks:
+    - name: Confirm Xray service is active after provisioning
+      ansible.builtin.systemd:
+        name: "{{ xray_service_name }}"
+      register: xray_post_state
+      failed_when: xray_post_state.status.ActiveState != 'active'
+      changed_when: false
+      tags: [always, validate]
+
+    - name: Display final service status
+      ansible.builtin.debug:
+        msg: >-
+          ✔ JFrog Xray {{ xray_version }} is {{ xray_post_state.status.ActiveState }}
+          on {{ inventory_hostname }}.
+      tags: [always, validate]

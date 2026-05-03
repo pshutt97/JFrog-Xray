@@ -1,0 +1,86 @@
+---
+# =============================================================================
+# Role defaults – lowest precedence, safe to override at any higher level.
+# =============================================================================
+
+# --- Core version & action ---
+xray_version: "3.88.9"
+xray_action: "install"
+
+# --- Filesystem layout ---
+xray_install_dir: /opt/jfrog/xray
+xray_data_dir: /var/opt/jfrog/xray
+xray_log_dir: /var/log/jfrog/xray
+xray_installer_dir: /opt/jfrog/installers
+xray_upgrade_backup_dir: /opt/jfrog/backups
+
+# --- Service name (matches systemd unit) ---
+xray_service_name: xray
+
+# --- System user/group ---
+xray_create_system_user: true
+xray_system_user: xray
+xray_system_group: xray
+xray_system_user_uid: 1050
+xray_system_user_gid: 1050
+xray_system_user_shell: /sbin/nologin
+
+# --- Network ports ---
+xray_http_port: 8000
+xray_grpc_port: 7777
+xray_router_port: 8082
+
+# --- OS tuning ---
+xray_open_files_limit: 32000
+xray_max_map_count: 262144
+
+# --- Database ---
+xray_db_type: "postgresql"
+xray_db_host: "localhost"
+xray_db_port: 5432
+xray_db_name: "xraydb"
+xray_db_user: "xray"
+xray_db_password: "changeme"   # Always override via Vault in production!
+
+# --- RabbitMQ ---
+xray_rabbitmq_bundled: true
+xray_rabbitmq_host: "localhost"
+xray_rabbitmq_port: 5672
+xray_rabbitmq_user: "xray"
+xray_rabbitmq_password: "changeme"
+
+# --- JFrog Platform (Artifactory) ---
+jfrog_platform_url: "https://artifactory.example.com"
+jfrog_platform_admin_user: "admin"
+jfrog_platform_admin_token: ""
+
+# --- Download source ---
+xray_download_base_url: "https://releases.jfrog.io/artifactory/jfrog-xray"
+xray_use_local_mirror: false
+xray_local_mirror_base_url: ""
+xray_installer_checksum_algo: "sha256"
+
+# --- Installer script name pattern (resolved at runtime) ---
+# Final filename: xray-<version>-linux.tar.gz
+xray_installer_archive: "xray-{{ xray_version }}-linux.tar.gz"
+
+# --- Upgrade settings ---
+xray_upgrade_backup: true
+xray_upgrade_drain_timeout: 120
+
+# --- Proxy ---
+xray_http_proxy: ""
+xray_https_proxy: ""
+xray_no_proxy: "localhost,127.0.0.1"
+
+# --- SELinux & firewall ---
+xray_configure_selinux: true
+xray_configure_firewall: true
+xray_firewall_zone: "public"
+
+# --- Features ---
+xray_enable_vuln_db_sync: true
+xray_enable_watches: true
+
+# --- Xray node identification (auto-derived if unset) ---
+# xray_node_id: ""    # Defaults to inventory_hostname in templates

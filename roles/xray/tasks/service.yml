@@ -1,0 +1,74 @@
+---
+# =============================================================================
+# tasks/service.yml
+# Ensure the Xray systemd service is correctly enabled and running.
+# This task file is the last step in every workflow. It also exposes a
+# small health-check loop so the play doesn't declare success prematurely.
+# =============================================================================
+
+# ── 1. Flush pending handlers first ──────────────────────────────────────────
+# Any restart/reload notifications queued by configure.yml are processed
+# before we attempt the health-check below.
+
+- name: "[SERVICE] Flush handlers before health check"
+  ansible.builtin.meta: flush_handlers
+
+# ── 2. Enable and start service ───────────────────────────────────────────────
+
+- name: "[SERVICE] Enable and start Xray systemd service"
+  ansible.builtin.systemd:
+    name: "{{ xray_service_name }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+# ── 3. HTTP health check ──────────────────────────────────────────────────────
+# Xray's /api/v1/system/ping returns HTTP 200 when all internal subsystems
+# (database, RabbitMQ, indexer) are operational.
+# We retry for up to 3 minutes (18 × 10s) to allow the JVM to warm up.
+
+- name: "[SERVICE] Wait for Xray HTTP ping to return 200"
+  ansible.builtin.uri:
+    url: "http://localhost:{{ xray_http_port }}/api/v1/system/ping"
+    method: GET
+    status_code: 200
+    timeout: 10
+    return_content: true
+  register: xray_health
+  retries: 18
+  delay: 10
+  until: xray_health.status == 200
+  failed_when: xray_health.status != 200
+
+- name: "[SERVICE] Confirm gRPC port is listening"
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ xray_grpc_port }}"
+    state: started
+    timeout: 30
+
+- name: "[SERVICE] Confirm router port is listening"
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ xray_router_port }}"
+    state: started
+    timeout: 30
+
+# ── 4. Service state report ───────────────────────────────────────────────────
+
+- name: "[SERVICE] Collect final systemd unit status"
+  ansible.builtin.command:
+    cmd: "systemctl status {{ xray_service_name }}"
+  register: xray_unit_status
+  changed_when: false
+  failed_when: false
+
+- name: "[SERVICE] Display service status summary"
+  ansible.builtin.debug:
+    msg:
+      - "=== Xray Service Health ==="
+      - "HTTP ping   : {{ xray_health.status }} {{ xray_health.content | default('') }}"
+      - "systemd     : {{ xray_unit_status.stdout_lines[2] | default('N/A') | trim }}"
+      - "HTTP port   : {{ xray_http_port }} – OPEN"
+      - "gRPC port   : {{ xray_grpc_port }} – OPEN"
+      - "Router port : {{ xray_router_port }} – OPEN"

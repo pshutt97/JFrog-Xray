@@ -1,0 +1,165 @@
+---
+# =============================================================================
+# tasks/system_prep.yml
+# Idempotent system-level preparation: OS packages, system user/group,
+# directory layout, kernel parameters, SELinux, and firewalld.
+# This runs regardless of xray_action (install, upgrade, configure) so that
+# the host always converges to the required baseline state.
+# =============================================================================
+
+# ── 1. OS Packages ──────────────────────────────────────────────────────────
+
+- name: "[SYSTEM_PREP] Ensure DNF cache is fresh"
+  ansible.builtin.dnf:
+    update_cache: true
+  changed_when: false
+
+- name: "[SYSTEM_PREP] Install required OS packages"
+  ansible.builtin.dnf:
+    name: "{{ xray_required_packages }}"
+    state: present
+
+# ── 2. System User & Group ──────────────────────────────────────────────────
+
+- name: "[SYSTEM_PREP] Create xray system group"
+  ansible.builtin.group:
+    name: "{{ xray_system_group }}"
+    gid: "{{ xray_system_user_gid }}"
+    system: true
+    state: present
+  when: xray_create_system_user
+
+- name: "[SYSTEM_PREP] Create xray system user"
+  ansible.builtin.user:
+    name: "{{ xray_system_user }}"
+    uid: "{{ xray_system_user_uid }}"
+    group: "{{ xray_system_group }}"
+    shell: "{{ xray_system_user_shell }}"
+    home: "{{ xray_data_dir }}"
+    create_home: false
+    system: true
+    comment: "JFrog Xray service account"
+    state: present
+  when: xray_create_system_user
+
+# ── 3. Directory Layout ─────────────────────────────────────────────────────
+
+- name: "[SYSTEM_PREP] Create required directories"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ xray_managed_directories }}"
+
+# ── 4. Kernel Parameters ─────────────────────────────────────────────────────
+# vm.max_map_count is required by Xray's embedded Elasticsearch/OpenSearch.
+# fs.file-max ensures the OS can handle enough open file descriptors.
+
+- name: "[SYSTEM_PREP] Set kernel parameters via sysctl"
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-jfrog-xray.conf
+  loop:
+    - { name: "vm.max_map_count", value: "{{ xray_max_map_count }}" }
+    - { name: "fs.file-max",      value: "{{ xray_open_files_limit * 4 }}" }
+
+# ── 5. systemd Resource Limits ───────────────────────────────────────────────
+# Drop-in file ensures the Xray process inherits generous limits even if
+# the base unit file is replaced during upgrades.
+
+- name: "[SYSTEM_PREP] Create systemd drop-in directory for Xray"
+  ansible.builtin.file:
+    path: "{{ xray_systemd_dropin_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "[SYSTEM_PREP] Write systemd limits drop-in"
+  ansible.builtin.copy:
+    dest: "{{ xray_systemd_dropin_dir }}/limits.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible – do not edit manually.
+      [Service]
+      LimitNOFILE={{ xray_open_files_limit }}
+      LimitNPROC=8192
+      LimitCORE=infinity
+  notify: Reload systemd daemon
+
+# ── 6. /etc/security/limits.conf (PAM fallback) ──────────────────────────────
+
+- name: "[SYSTEM_PREP] Set PAM open-files limits for xray user"
+  community.general.pam_limits:
+    domain: "{{ xray_system_user }}"
+    limit_type: "{{ item.type }}"
+    limit_item: nofile
+    value: "{{ xray_open_files_limit }}"
+  loop:
+    - { type: soft }
+    - { type: hard }
+
+# ── 7. SELinux ───────────────────────────────────────────────────────────────
+
+- name: "[SYSTEM_PREP] Apply SELinux file contexts for Xray directories"
+  community.general.sefcontext:
+    target: "{{ item.path }}"
+    setype: "{{ item.type }}"
+    state: present
+  loop: "{{ xray_selinux_fcontexts }}"
+  when: xray_configure_selinux
+  notify: Restore SELinux file contexts
+
+- name: "[SYSTEM_PREP] Set required SELinux booleans"
+  ansible.posix.seboolean:
+    name: "{{ item }}"
+    state: true
+    persistent: true
+  loop:
+    - httpd_can_network_connect
+    - nis_enabled             # Allows broad network connectivity for service accounts
+  when: xray_configure_selinux
+
+# ── 8. Firewalld ─────────────────────────────────────────────────────────────
+
+- name: "[SYSTEM_PREP] Ensure firewalld is started and enabled"
+  ansible.builtin.service:
+    name: firewalld
+    state: started
+    enabled: true
+  when: xray_configure_firewall
+
+- name: "[SYSTEM_PREP] Open Xray ports in firewalld"
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    zone: "{{ xray_firewall_zone }}"
+    state: enabled
+    permanent: true
+    immediate: true
+  loop:
+    - "{{ xray_http_port }}"
+    - "{{ xray_grpc_port }}"
+    - "{{ xray_router_port }}"
+  when: xray_configure_firewall
+
+# ── 9. Proxy environment (if configured) ─────────────────────────────────────
+
+- name: "[SYSTEM_PREP] Configure system-wide proxy environment file"
+  ansible.builtin.blockinfile:
+    path: /etc/environment
+    marker: "# {mark} ANSIBLE MANAGED – JFrog Xray proxy settings"
+    block: |
+      HTTP_PROXY={{ xray_http_proxy }}
+      HTTPS_PROXY={{ xray_https_proxy }}
+      NO_PROXY={{ xray_no_proxy }}
+      http_proxy={{ xray_http_proxy }}
+      https_proxy={{ xray_https_proxy }}
+      no_proxy={{ xray_no_proxy }}
+    state: "{{ 'present' if xray_http_proxy else 'absent' }}"

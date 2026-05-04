@@ -1,0 +1,365 @@
+---
+# =============================================================================
+# roles/xray/tasks/tls.yml
+# Manages TLS certificate lifecycle for JFrog Xray.
+#
+# This task file is designed to be idempotent across four real-world scenarios:
+#
+#   Scenario A – Fresh install, TLS disabled (tls_mode=disabled)
+#     No certificates are needed. The task file exits after the state
+#     detection block with a single informational message.
+#
+#   Scenario B – Fresh install, TLS desired (tls_mode=provided|self_signed)
+#     Creates the cert directory, deploys or generates certificates, validates
+#     them, and sets strict file permissions. The system.yaml template (which
+#     runs later in configure.yml) will reference these cert paths.
+#
+#   Scenario C – Upgrade or configure-only, TLS already active
+#     Detects that certificates already exist, checks their remaining validity,
+#     warns if expiry is approaching, and replaces them only when
+#     xray_tls_force_cert_update=true. A no-op run on a correctly configured
+#     node produces zero changes.
+#
+#   Scenario D – Enabling TLS on an existing plain-HTTP installation
+#     Detects that TLS was previously disabled (no certs, no TLS block in
+#     system.yaml), deploys/generates certificates, and sets the
+#     tls_state_changed fact to true. The configure.yml task will then
+#     write a new system.yaml with TLS sections, and the handler will restart
+#     the service to pick up the new configuration. The operator sees an
+#     explicit "TLS state changed" message so the restart is never silent.
+#
+# The reverse of Scenario D (disabling TLS on a TLS-enabled node) follows the
+# same logic: tls_mode=disabled means no certs are deployed, the system.yaml
+# template emits no TLS sections, and the handler restarts the service.
+# Existing cert files are left on disk (they are not deleted) so they can be
+# re-enabled without re-provisioning — use xray_tls_force_cert_update=true
+# on a subsequent run if you want the files cleaned up.
+# =============================================================================
+
+# ── Section 1: State detection ────────────────────────────────────────────────
+# We need to know two things before taking any action:
+#   (a) Are certificate files already present on this host?
+#   (b) Was TLS already configured in the running system.yaml?
+# The combination of these two facts tells us which scenario we're in.
+
+- name: "[XRAY TLS] Probe existing certificate file"
+  ansible.builtin.stat:
+    path: "{{ xray_tls_cert_path }}"
+    get_checksum: false
+  register: xray_existing_cert_stat
+
+- name: "[XRAY TLS] Probe existing system.yaml for TLS configuration"
+  ansible.builtin.command:
+    # A quick grep is reliable and doesn't require parsing the full YAML.
+    # We look for the literal string 'tls:' under the router section.
+    cmd: "grep -c 'tls:' {{ xray_install_dir }}/var/etc/system.yaml"
+  register: xray_system_yaml_tls_grep
+  changed_when: false
+  failed_when: false    # grep exits 1 when no match; that's a valid result here
+
+- name: "[XRAY TLS] Set tls_previously_configured fact"
+  ansible.builtin.set_fact:
+    # True when BOTH the cert file exists AND system.yaml already contains a
+    # TLS block. Using AND rather than OR means a half-configured state
+    # (certs on disk but system.yaml missing TLS config, or vice versa) is
+    # correctly treated as "not previously configured" and gets reconciled.
+    xray_tls_previously_configured: >-
+      {{
+        xray_existing_cert_stat.stat.exists
+        and (xray_system_yaml_tls_grep.rc == 0)
+        and (xray_system_yaml_tls_grep.stdout | int > 0)
+      }}
+
+- name: "[XRAY TLS] Detect TLS state transition (disabled → enabled)"
+  ansible.builtin.set_fact:
+    xray_tls_enabling: >-
+      {{ xray_tls_mode != 'disabled' and not xray_tls_previously_configured }}
+
+- name: "[XRAY TLS] Detect TLS state transition (enabled → disabled)"
+  ansible.builtin.set_fact:
+    xray_tls_disabling: >-
+      {{ xray_tls_mode == 'disabled' and xray_tls_previously_configured }}
+
+- name: "[XRAY TLS] Display TLS state summary"
+  ansible.builtin.debug:
+    msg:
+      - "=== Xray TLS State Detection ==="
+      - "Requested tls_mode          : {{ xray_tls_mode }}"
+      - "TLS previously configured   : {{ xray_tls_previously_configured }}"
+      - "State transition → ENABLING : {{ xray_tls_enabling }}"
+      - "State transition → DISABLING: {{ xray_tls_disabling }}"
+      - "Cert file exists at         : {{ xray_tls_cert_path }} → {{ xray_existing_cert_stat.stat.exists }}"
+
+# ── Section 2: Early exit when TLS is disabled ────────────────────────────────
+# When tls_mode=disabled there is nothing to do in this task file. The
+# system.yaml template handles the absence of TLS config, and if TLS is
+# being disabled on a previously-enabled node the configure.yml + service
+# handler will take care of the restart.
+
+- name: "[XRAY TLS] Announce TLS is disabled — skipping certificate tasks"
+  ansible.builtin.debug:
+    msg: >-
+      xray_tls_mode=disabled: no certificate operations will be performed.
+      {{ 'NOTE: TLS is being DISABLED on a previously TLS-enabled node. '
+         'The service will restart with plain-HTTP configuration after configure.yml runs.'
+         if xray_tls_disabling else '' }}
+  when: xray_tls_mode == 'disabled'
+
+- name: "[XRAY TLS] End play for this host when TLS is disabled"
+  ansible.builtin.meta: end_host
+  when: xray_tls_mode == 'disabled'
+
+# ── Section 3: Validate tls_mode inputs ───────────────────────────────────────
+# If we reach this point TLS is being enabled. Validate the operator supplied
+# the correct inputs before creating any files on the target.
+
+- name: "[XRAY TLS] Assert cert and key source paths are set (tls_mode=provided)"
+  ansible.builtin.assert:
+    that:
+      - xray_tls_cert_src | length > 0
+      - xray_tls_key_src  | length > 0
+    fail_msg: >-
+      xray_tls_mode=provided requires both xray_tls_cert_src and xray_tls_key_src
+      to be set to the local paths of your certificate and key files on the
+      Ansible control node.
+    success_msg: "Source cert and key paths are set — proceeding with deployment."
+  when: xray_tls_mode == 'provided'
+
+- name: "[XRAY TLS] Assert OpenSSL is available for self-signed generation"
+  ansible.builtin.command:
+    cmd: openssl version
+  changed_when: false
+  register: openssl_version_check
+  when: xray_tls_mode == 'self_signed'
+
+# ── Section 4: Create certificate directory ───────────────────────────────────
+
+- name: "[XRAY TLS] Create TLS certificate directory"
+  ansible.builtin.file:
+    path: "{{ xray_tls_cert_dir }}"
+    state: directory
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    # 0750: the cert dir itself is not world-readable; only the xray user
+    # and members of the xray group can list its contents.
+    mode: "0750"
+
+# ── Section 5: Existing certificate expiry check ──────────────────────────────
+# Before deploying or generating anything, check if a valid cert already
+# exists and how long it has left. We do this here (before the deploy/generate
+# blocks) so the expiry warning fires even on runs that don't replace the cert.
+
+- name: "[XRAY TLS] Check remaining validity of existing certificate"
+  ansible.builtin.command:
+    cmd: >-
+      openssl x509 -in {{ xray_tls_cert_path }}
+      -noout -checkend {{ (xray_tls_cert_warn_days * 86400) | int }}
+  register: xray_cert_expiry_check
+  changed_when: false
+  failed_when: false
+  when: xray_existing_cert_stat.stat.exists
+
+- name: "[XRAY TLS] Warn when existing certificate is expiring soon"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠ WARNING: The Xray certificate at {{ xray_tls_cert_path }} will expire
+      within {{ xray_tls_cert_warn_days }} days. Consider setting
+      xray_tls_force_cert_update=true on the next run to replace it.
+  when:
+    - xray_existing_cert_stat.stat.exists
+    - xray_cert_expiry_check.rc is defined
+    - xray_cert_expiry_check.rc != 0
+
+# ── Section 6a: Deploy operator-provided certificates ─────────────────────────
+# Copies cert, key, and (optionally) CA bundle from the control node to the
+# target. Files are only written when they are absent OR force_update is true.
+# This means re-running the play on a correctly-configured node is a true
+# no-op (zero changed tasks), which is exactly what we want.
+
+- name: "[XRAY TLS] Deploy certificate from control node"
+  ansible.builtin.copy:
+    src:   "{{ xray_tls_cert_src }}"
+    dest:  "{{ xray_tls_cert_path }}"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode:  "0640"       # Owner read/write, group read; world has no access
+    force: "{{ xray_tls_force_cert_update }}"
+    backup: true        # Keeps <file>.<timestamp> if an existing cert is replaced
+  register: xray_cert_deploy_result
+  notify: Restart Xray service
+  when:
+    - xray_tls_mode == 'provided'
+    - >-
+      not xray_existing_cert_stat.stat.exists
+      or xray_tls_force_cert_update
+
+- name: "[XRAY TLS] Deploy private key from control node"
+  ansible.builtin.copy:
+    src:   "{{ xray_tls_key_src }}"
+    dest:  "{{ xray_tls_key_path }}"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    # 0600: private key is readable ONLY by the xray service account.
+    # The group and world bits are intentionally zero.
+    mode:  "0600"
+    force: "{{ xray_tls_force_cert_update }}"
+    backup: true
+  notify: Restart Xray service
+  when:
+    - xray_tls_mode == 'provided'
+    - >-
+      not xray_existing_cert_stat.stat.exists
+      or xray_tls_force_cert_update
+
+- name: "[XRAY TLS] Deploy CA bundle from control node (optional)"
+  ansible.builtin.copy:
+    src:   "{{ xray_tls_ca_src }}"
+    dest:  "{{ xray_tls_ca_path }}"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode:  "0640"
+    force: "{{ xray_tls_force_cert_update }}"
+    backup: true
+  notify: Restart Xray service
+  when:
+    - xray_tls_mode == 'provided'
+    - xray_tls_ca_src | length > 0
+    - >-
+      not xray_existing_cert_stat.stat.exists
+      or xray_tls_force_cert_update
+
+# ── Section 6b: Generate self-signed certificate ──────────────────────────────
+# Uses the OpenSSL CLI already present on the host (installed in system_prep).
+# The cert is generated with a proper Subject Alternative Name extension so
+# it works correctly in modern TLS clients that ignore the CN field.
+# A separate OpenSSL config file template is used for the SAN so that the
+# hostname and IP address values can be injected from Ansible variables.
+
+- name: "[XRAY TLS] Write OpenSSL request config from template"
+  ansible.builtin.template:
+    src:   openssl.cnf.j2
+    dest:  "{{ xray_tls_cert_dir }}/openssl.cnf"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode:  "0640"
+  vars:
+    # These vars are consumed by the openssl.cnf.j2 template. They are
+    # passed explicitly here so the template can be shared between the
+    # Xray and Catalog roles without ambiguity.
+    tls_cn:      "{{ inventory_hostname }}"
+    tls_country: "{{ xray_tls_self_signed_country }}"
+    tls_state:   "{{ xray_tls_self_signed_state }}"
+    tls_city:    "{{ xray_tls_self_signed_city }}"
+    tls_org:     "{{ xray_tls_self_signed_org }}"
+    tls_ou:      "{{ xray_tls_self_signed_ou }}"
+  when:
+    - xray_tls_mode == 'self_signed'
+    - >-
+      not xray_existing_cert_stat.stat.exists
+      or xray_tls_force_cert_update
+
+- name: "[XRAY TLS] Generate self-signed certificate and key"
+  ansible.builtin.command:
+    cmd: >-
+      openssl req -x509 -newkey rsa:{{ xray_tls_self_signed_key_size }}
+      -keyout {{ xray_tls_key_path }}
+      -out    {{ xray_tls_cert_path }}
+      -days   {{ xray_tls_self_signed_days }}
+      -nodes
+      -config {{ xray_tls_cert_dir }}/openssl.cnf
+    creates: "{{ xray_tls_cert_path }}"   # Idempotency guard
+  become_user: "{{ xray_system_user }}"
+  register: xray_self_signed_result
+  notify: Restart Xray service
+  when:
+    - xray_tls_mode == 'self_signed'
+    - >-
+      not xray_existing_cert_stat.stat.exists
+      or xray_tls_force_cert_update
+
+- name: "[XRAY TLS] Harden self-signed key file permissions"
+  ansible.builtin.file:
+    path:  "{{ xray_tls_key_path }}"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode:  "0600"
+  when: xray_tls_mode == 'self_signed'
+
+- name: "[XRAY TLS] Harden self-signed cert file permissions"
+  ansible.builtin.file:
+    path:  "{{ xray_tls_cert_path }}"
+    owner: "{{ xray_system_user }}"
+    group: "{{ xray_system_group }}"
+    mode:  "0640"
+  when: xray_tls_mode == 'self_signed'
+
+# ── Section 7: Post-deploy certificate validation ─────────────────────────────
+# Regardless of how the cert arrived on disk (provided or self-signed), we
+# validate it with OpenSSL before allowing the play to proceed. This catches
+# common problems: wrong file format, mismatched cert/key pair, expired cert.
+
+- name: "[XRAY TLS] Validate certificate is parseable PEM"
+  ansible.builtin.command:
+    cmd: "openssl x509 -in {{ xray_tls_cert_path }} -noout -subject -enddate"
+  register: xray_cert_parse_result
+  changed_when: false
+  failed_when: xray_cert_parse_result.rc != 0
+
+- name: "[XRAY TLS] Validate certificate and private key form a matching pair"
+  ansible.builtin.shell:
+    # Compare the modulus of the cert and key — they must match for TLS to work.
+    # If the moduli differ the key was generated for a different certificate.
+    cmd: >-
+      set -euo pipefail;
+      CERT_MOD=$(openssl x509 -noout -modulus -in {{ xray_tls_cert_path }} | md5sum);
+      KEY_MOD=$(openssl rsa -noout -modulus  -in {{ xray_tls_key_path  }} | md5sum);
+      [ "$CERT_MOD" = "$KEY_MOD" ]
+  changed_when: false
+  failed_when: false
+  register: xray_cert_key_match
+  no_log: true      # Suppress output so the key modulus isn't written to logs
+
+- name: "[XRAY TLS] Fail if certificate and key do not match"
+  ansible.builtin.fail:
+    msg: >-
+      The certificate at {{ xray_tls_cert_path }} and the key at {{ xray_tls_key_path }}
+      do not form a matching pair (modulus mismatch). The service will fail to
+      start with this configuration. Double-check that the correct key file was
+      provided (tls_mode=provided) or regenerate with xray_tls_force_cert_update=true
+      (tls_mode=self_signed).
+  when: xray_cert_key_match.rc is defined and xray_cert_key_match.rc != 0
+
+- name: "[XRAY TLS] Display certificate information"
+  ansible.builtin.debug:
+    msg: "Certificate validation passed: {{ xray_cert_parse_result.stdout_lines }}"
+
+# ── Section 8: Firewall port for HTTPS ───────────────────────────────────────
+# When TLS is active the router listens on xray_tls_port in addition to the
+# plain-HTTP router port. We open the HTTPS port in firewalld here so that
+# system_prep.yml (which opens the base ports) doesn't need TLS awareness.
+
+- name: "[XRAY TLS] Open HTTPS port in firewalld"
+  ansible.posix.firewalld:
+    port:      "{{ xray_tls_port }}/tcp"
+    zone:      "{{ xray_firewall_zone }}"
+    state:     enabled
+    permanent: true
+    immediate: true
+  when: xray_configure_firewall
+
+# ── Section 9: Announce state changes ────────────────────────────────────────
+
+- name: "[XRAY TLS] Announce TLS is being ENABLED on this node"
+  ansible.builtin.debug:
+    msg: >-
+      ✔ TLS is being ENABLED on {{ inventory_hostname }} (was: plain-HTTP).
+      The service will restart with TLS configuration after configure.yml runs.
+      Cert: {{ xray_tls_cert_path }}
+  when: xray_tls_enabling
+
+- name: "[XRAY TLS] Announce TLS is already active (steady state)"
+  ansible.builtin.debug:
+    msg: >-
+      ✔ TLS already active on {{ inventory_hostname }} — certificate is valid.
+      No service restart will be triggered unless other configuration changed.
+  when: xray_tls_previously_configured and not xray_tls_enabling

@@ -1,0 +1,62 @@
+{# =============================================================================
+   roles/catalog/templates/catalog.config.yaml.j2
+   JFrog Catalog behavioural configuration.
+
+   This file controls Catalog-specific runtime behaviour: curation policy
+   enforcement, upstream metadata synchronisation, and platform integration
+   settings. It is separate from system.yaml (which is infrastructure-level
+   config shared across all JFrog Platform services) because these settings
+   are Catalog's own domain and change at a different cadence.
+
+   Managed by Ansible – {{ ansible_date_time.iso8601 }}
+   Host: {{ inventory_hostname }}
+   ============================================================================= #}
+
+## ============================================================
+## JFrog Catalog – catalog.config.yaml
+## Host    : {{ inventory_hostname }}
+## Version : {{ catalog_version }}
+## ============================================================
+
+catalog:
+  # ── General identity ────────────────────────────────────────────────────────
+  # The serviceId is stamped on audit log entries and diagnostic events,
+  # which makes it easy to trace activity back to a specific node in a
+  # multi-node deployment without digging into hostnames.
+  serviceId: "{{ catalog_node_id | default(inventory_hostname | replace('.', '-')) }}"
+
+  # ── Upstream metadata synchronisation ───────────────────────────────────────
+  # When enabled, Catalog periodically pulls curated package metadata from
+  # JFrog's hosted metadata service (catalog.jfrog.io). This includes
+  # package health scores, licence information, and supply-chain risk signals.
+  # Disabling this makes Catalog operate on its locally cached metadata only,
+  # which is appropriate for fully air-gapped environments — but means the
+  # data will eventually become stale.
+  metadataSync:
+    enabled: {{ catalog_enable_metadata_sync | lower }}
+    # How often (in minutes) to poll for updated metadata.
+    # 0 = use the service default (currently 60 minutes).
+    intervalMinutes: 0
+
+  # ── Curation policy enforcement ─────────────────────────────────────────────
+  # Controls whether Catalog actively enforces curation policies (block or
+  # warn on packages that violate configured rules). Set to false for
+  # audit-only / read-only deployments where you want to observe violations
+  # without blocking developers.
+  curation:
+    enabled: {{ catalog_enable_curation_policies | lower }}
+
+    # The default action applied when a package matches a curation policy
+    # that has no explicit action configured. 'warn' surfaces the violation
+    # in the UI without blocking the download; 'block' prevents it entirely.
+    defaultAction: "warn"
+
+  # ── JFrog Platform integration ────────────────────────────────────────────
+  # These settings tell Catalog how to authenticate with the Artifactory
+  # instance it is joined to. The admin token must have sufficient permissions
+  # to read repository configurations and write curation audit events.
+  jfrogPlatform:
+    url:        "{{ jfrog_platform_url }}"
+    adminUser:  "{{ jfrog_platform_admin_user }}"
+    # Injected from Ansible Vault at deploy time — never hard-coded here.
+    adminToken: "{{ jfrog_platform_admin_token }}"

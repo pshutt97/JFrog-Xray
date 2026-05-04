@@ -1,0 +1,206 @@
+---
+# =============================================================================
+# roles/catalog/tasks/upgrade.yml
+# In-place upgrade of an existing JFrog Catalog installation.
+# Only executed when catalog_action == 'upgrade' and preflight has confirmed
+# an existing installation is present.
+#
+# The upgrade sequence is intentionally conservative:
+#   1. Health-poll and graceful stop (preserve in-flight curation requests)
+#   2. Optional rsync backup of the data directory
+#   3. Download and extract the new installer
+#   4. Run the upgrade script (preserves config and data in place)
+#   5. Health-poll until the new version is serving requests
+#   6. Binary version assertion (hard failure if version does not match)
+#
+# Every step is designed so that if the play fails partway through, re-running
+# it (with catalog_action=upgrade and the same version) will converge correctly
+# rather than putting the service into an inconsistent state.
+# =============================================================================
+
+# ── 1. Graceful drain and stop ────────────────────────────────────────────────
+# Catalog is lighter than Xray — there are no long-running binary scan jobs
+# to drain. We still poll the health endpoint before stopping, both as a
+# sanity check that the service is actually running and to give any in-flight
+# curation policy evaluations a moment to complete.
+
+- name: "[CATALOG UPGRADE] Confirm Catalog is healthy before stopping"
+  ansible.builtin.uri:
+    url: "http://localhost:{{ catalog_http_port }}/api/v1/system/ping"
+    method: GET
+    status_code: 200
+    timeout: 10
+  register: pre_stop_ping
+  retries: "{{ (catalog_upgrade_drain_timeout / 10) | int }}"
+  delay: 10
+  until: pre_stop_ping.status == 200
+  # Non-fatal: if Catalog is already down we still want the upgrade to proceed
+  # (e.g. the operator stopped it manually before running the play).
+  failed_when: false
+  changed_when: false
+
+- name: "[CATALOG UPGRADE] Stop Catalog service gracefully before upgrade"
+  ansible.builtin.systemd:
+    name: "{{ catalog_service_name }}"
+    state: stopped
+
+- name: "[CATALOG UPGRADE] Confirm Catalog service is stopped"
+  ansible.builtin.systemd:
+    name: "{{ catalog_service_name }}"
+  register: catalog_stopped_state
+  failed_when: catalog_stopped_state.status.ActiveState not in ['inactive', 'failed']
+  changed_when: false
+
+# ── 2. Pre-upgrade data backup ────────────────────────────────────────────────
+# An rsync snapshot of the data directory before touching any binaries.
+# If the upgrade fails catastrophically this gives the operator a clean
+# restore point without requiring a hypervisor snapshot.
+# Set catalog_upgrade_backup: false to skip (e.g. if you snapshot at the
+# hypervisor or storage layer instead).
+
+- name: "[CATALOG UPGRADE] Create timestamped backup directory"
+  ansible.builtin.file:
+    path: >-
+      {{ catalog_upgrade_backup_dir }}/catalog-{{ catalog_installed_version }}-{{ ansible_date_time.epoch }}
+    state: directory
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "0750"
+  register: catalog_backup_dir
+  when: catalog_upgrade_backup
+
+- name: "[CATALOG UPGRADE] Back up Catalog data directory (rsync)"
+  ansible.posix.synchronize:
+    src: "{{ catalog_data_dir }}/"
+    dest: "{{ catalog_backup_dir.path }}/"
+    archive: true
+    checksum: true
+    delete: false
+  delegate_to: "{{ inventory_hostname }}"
+  become: true
+  when: catalog_upgrade_backup
+
+- name: "[CATALOG UPGRADE] Record backup location"
+  ansible.builtin.debug:
+    msg: "Backup written to: {{ catalog_backup_dir.path }}"
+  when: catalog_upgrade_backup
+
+# ── 3. Download new installer ─────────────────────────────────────────────────
+# 'force: true' ensures we always pull a fresh copy even if a tarball from a
+# previous run already exists at the destination path. Stale tarballs from
+# a previous (possibly failed) upgrade attempt are a common source of
+# hard-to-debug upgrade failures.
+
+- name: "[CATALOG UPGRADE] Download new Catalog installer archive"
+  ansible.builtin.get_url:
+    url: "{{ catalog_download_url }}"
+    dest: "{{ catalog_installer_dir }}/{{ catalog_installer_archive }}"
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "0640"
+    timeout: 300
+    force: true
+  register: catalog_upgrade_download
+  retries: 3
+  delay: 15
+  until: catalog_upgrade_download is succeeded
+  environment:
+    http_proxy:  "{{ catalog_http_proxy  | default(omit) }}"
+    https_proxy: "{{ catalog_https_proxy | default(omit) }}"
+    no_proxy:    "{{ catalog_no_proxy    | default(omit) }}"
+
+# ── 4. Extract new installer ──────────────────────────────────────────────────
+
+- name: "[CATALOG UPGRADE] Extract new Catalog installer archive"
+  ansible.builtin.unarchive:
+    src: "{{ catalog_installer_dir }}/{{ catalog_installer_archive }}"
+    dest: "{{ catalog_installer_dir }}"
+    remote_src: true
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+
+- name: "[CATALOG UPGRADE] Set extracted installer directory fact"
+  ansible.builtin.set_fact:
+    catalog_extracted_dir: "{{ catalog_installer_dir }}/catalog-{{ catalog_version }}"
+
+- name: "[CATALOG UPGRADE] Ensure upgrade script is executable"
+  ansible.builtin.file:
+    path: "{{ catalog_extracted_dir }}/{{ catalog_installer_upgrade_script }}"
+    mode: "0755"
+
+# ── 5. Write system.yaml for upgrade ─────────────────────────────────────────
+
+- name: "[CATALOG UPGRADE] Write installer config (system.yaml) from template"
+  ansible.builtin.template:
+    src: system.yaml.j2
+    dest: "{{ catalog_extracted_dir }}/system.yaml"
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "0640"
+
+# ── 6. Execute upgrade script ─────────────────────────────────────────────────
+# The JFrog upgrade script preserves the existing data directory and
+# configuration in place, replacing only the application binaries.
+
+- name: "[CATALOG UPGRADE] Execute Catalog upgrade script"
+  ansible.builtin.command:
+    cmd: >-
+      {{ catalog_extracted_dir }}/{{ catalog_installer_upgrade_script }}
+      --install-dir {{ catalog_install_dir }}
+      --data-dir    {{ catalog_data_dir }}
+      --log-dir     {{ catalog_log_dir }}
+      --config      {{ catalog_extracted_dir }}/system.yaml
+  become_user: root
+  register: catalog_upgrade_result
+  notify:
+    - Reload systemd daemon
+    - Start Catalog service
+
+- name: "[CATALOG UPGRADE] Display upgrade script output"
+  ansible.builtin.debug:
+    var: catalog_upgrade_result.stdout_lines
+  when: catalog_upgrade_result.stdout_lines is defined
+
+# ── 7. Post-upgrade health verification ───────────────────────────────────────
+# Flush handlers first so the service is started by the time we begin polling.
+
+- name: "[CATALOG UPGRADE] Flush handlers to start Catalog service"
+  ansible.builtin.meta: flush_handlers
+
+- name: "[CATALOG UPGRADE] Wait for Catalog HTTP ping to return 200 after upgrade"
+  ansible.builtin.uri:
+    url: "http://localhost:{{ catalog_http_port }}/api/v1/system/ping"
+    method: GET
+    status_code: 200
+    timeout: 10
+  register: post_upgrade_ping
+  retries: 18
+  delay: 10
+  until: post_upgrade_ping.status == 200
+
+# ── 8. Binary version assertion ───────────────────────────────────────────────
+# Hard failure if the running binary doesn't match the requested version.
+# This catches partial upgrades (e.g., script ran but binaries weren't
+# replaced) before the operator declares success and walks away.
+
+- name: "[CATALOG UPGRADE] Confirm upgraded version"
+  ansible.builtin.command:
+    cmd: "{{ catalog_install_dir }}/app/bin/catalog --version"
+  register: upgraded_version_raw
+  changed_when: false
+
+- name: "[CATALOG UPGRADE] Assert running version matches requested version"
+  ansible.builtin.assert:
+    that: catalog_version in upgraded_version_raw.stdout
+    fail_msg: >-
+      Version mismatch after upgrade! Expected {{ catalog_version }},
+      binary reports: {{ upgraded_version_raw.stdout }}.
+    success_msg: "✔ Upgrade confirmed – JFrog Catalog {{ catalog_version }} is running."
+
+- name: "[CATALOG UPGRADE] Display upgrade summary"
+  ansible.builtin.debug:
+    msg:
+      - "=== Catalog Upgrade Complete ==="
+      - "Previous version : {{ catalog_installed_version }}"
+      - "Current version  : {{ catalog_version }}"
+      - "Backup location  : {{ catalog_backup_dir.path | default('N/A (backup disabled)') }}"

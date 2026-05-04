@@ -1,0 +1,105 @@
+---
+# =============================================================================
+# roles/catalog/tasks/configure.yml
+# Applies and reconciles JFrog Catalog runtime configuration. This task file
+# runs after both installs and upgrades, and can also be triggered standalone
+# via catalog_action=configure to converge any configuration drift without
+# touching the application binary.
+#
+# Two files govern Catalog's runtime behaviour:
+#   system.yaml          – JFrog Platform-level settings (DB, ports, platform URL)
+#   catalog.config.yaml  – Catalog-specific settings (curation policies, sync)
+#
+# Both are templated from Jinja2 so all values flow from Ansible variables,
+# and both carry 'notify: Restart Catalog service' so a configuration change
+# on any re-run automatically triggers a service restart via the handler.
+# =============================================================================
+
+# ── 1. Deploy system.yaml ─────────────────────────────────────────────────────
+# system.yaml lives at $CATALOG_HOME/var/etc/system.yaml — the standard
+# JFrog Platform config path, consistent across Xray, Catalog, and Artifactory.
+
+- name: "[CATALOG CONFIGURE] Deploy system.yaml from template"
+  ansible.builtin.template:
+    src: system.yaml.j2
+    dest: "{{ catalog_install_dir }}/var/etc/system.yaml"
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "0640"
+    backup: true        # Keeps the previous copy as system.yaml.<timestamp>
+  notify: Restart Catalog service
+
+# ── 2. Deploy catalog.config.yaml ────────────────────────────────────────────
+
+- name: "[CATALOG CONFIGURE] Deploy catalog.config.yaml from template"
+  ansible.builtin.template:
+    src: catalog.config.yaml.j2
+    dest: "{{ catalog_install_dir }}/var/etc/catalog/catalog.config.yaml"
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "0640"
+    backup: true
+  notify: Restart Catalog service
+
+# ── 3. Logrotate ──────────────────────────────────────────────────────────────
+# Catalog logs are rotated daily and kept for 14 days, matching Xray's
+# policy for consistency. The postrotate script sends SIGHUP rather than
+# restarting the service, which is sufficient for most JVM-based loggers.
+
+- name: "[CATALOG CONFIGURE] Install logrotate configuration for Catalog"
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/jfrog-catalog
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible – JFrog Catalog log rotation
+      {{ catalog_log_dir }}/*.log {
+          daily
+          rotate 14
+          compress
+          delaycompress
+          missingok
+          notifempty
+          sharedscripts
+          postrotate
+              systemctl kill -s HUP {{ catalog_service_name }} 2>/dev/null || true
+          endscript
+      }
+
+# ── 4. Configuration syntax validation ───────────────────────────────────────
+# A quick Python-level YAML parse catches most authoring errors (mismatched
+# quotes, bad indentation) before the service attempts to load the file.
+# This is not a semantic check — Catalog itself does that on startup — but
+# it catches the class of errors that would otherwise produce a confusing
+# "failed to parse config" error in the service logs.
+
+- name: "[CATALOG CONFIGURE] Verify system.yaml is parseable YAML"
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c
+      "import yaml,sys; yaml.safe_load(open('{{ catalog_install_dir }}/var/etc/system.yaml'))"
+  changed_when: false
+  register: catalog_system_yaml_check
+  failed_when: catalog_system_yaml_check.rc != 0
+
+- name: "[CATALOG CONFIGURE] Verify catalog.config.yaml is parseable YAML"
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c
+      "import yaml,sys; yaml.safe_load(open('{{ catalog_install_dir }}/var/etc/catalog/catalog.config.yaml'))"
+  changed_when: false
+  register: catalog_config_yaml_check
+  failed_when: catalog_config_yaml_check.rc != 0
+
+# ── 5. Ownership reconciliation ───────────────────────────────────────────────
+# Ensures file permissions haven't drifted — e.g. if the installer or upgrade
+# script created files owned by root that should belong to the catalog user.
+
+- name: "[CATALOG CONFIGURE] Reconcile ownership on Catalog var directory"
+  ansible.builtin.file:
+    path: "{{ catalog_install_dir }}/var"
+    state: directory
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    recurse: true

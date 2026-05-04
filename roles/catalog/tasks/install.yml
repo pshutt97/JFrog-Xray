@@ -1,0 +1,136 @@
+---
+# =============================================================================
+# roles/catalog/tasks/install.yml
+# Fresh installation of JFrog Catalog. Only executed when
+# catalog_action == 'install' and preflight has confirmed no prior
+# installation exists at catalog_install_dir.
+#
+# The flow exactly mirrors the Xray install workflow:
+#   download → extract → write system.yaml → run installer → verify
+# This deliberate symmetry means operators familiar with the Xray role
+# can read this file and understand it immediately.
+# =============================================================================
+
+# ── 1. Download installer archive ─────────────────────────────────────────────
+
+- name: "[CATALOG INSTALL] Download Catalog installer archive"
+  ansible.builtin.get_url:
+    url: "{{ catalog_download_url }}"
+    dest: "{{ catalog_installer_dir }}/{{ catalog_installer_archive }}"
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "0640"
+    timeout: 300
+  register: catalog_download_result
+  retries: 3
+  delay: 15
+  until: catalog_download_result is succeeded
+  environment:
+    http_proxy:  "{{ catalog_http_proxy  | default(omit) }}"
+    https_proxy: "{{ catalog_https_proxy | default(omit) }}"
+    no_proxy:    "{{ catalog_no_proxy    | default(omit) }}"
+
+# ── 2. Extract archive ────────────────────────────────────────────────────────
+# The 'creates:' argument makes this task idempotent: if the extracted
+# directory already exists (e.g. the play is re-run after a download),
+# the unarchive step is skipped entirely.
+
+- name: "[CATALOG INSTALL] Extract Catalog installer archive"
+  ansible.builtin.unarchive:
+    src: "{{ catalog_installer_dir }}/{{ catalog_installer_archive }}"
+    dest: "{{ catalog_installer_dir }}"
+    remote_src: true
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    creates: "{{ catalog_installer_dir }}/catalog-{{ catalog_version }}"
+
+- name: "[CATALOG INSTALL] Set extracted installer directory fact"
+  ansible.builtin.set_fact:
+    catalog_extracted_dir: "{{ catalog_installer_dir }}/catalog-{{ catalog_version }}"
+
+- name: "[CATALOG INSTALL] Ensure installer script is executable"
+  ansible.builtin.file:
+    path: "{{ catalog_extracted_dir }}/{{ catalog_installer_script }}"
+    mode: "0755"
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+
+# ── 3. Write installer configuration ─────────────────────────────────────────
+# The JFrog installer reads system.yaml from the same directory when invoked.
+# We write it from a Jinja2 template so all connection strings, ports, and
+# paths are rendered from Ansible variables — no manual editing on the host.
+
+- name: "[CATALOG INSTALL] Write installer config (system.yaml) from template"
+  ansible.builtin.template:
+    src: system.yaml.j2
+    dest: "{{ catalog_extracted_dir }}/system.yaml"
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "0640"
+
+# ── 4. Run the installer ──────────────────────────────────────────────────────
+# The 'creates:' guard makes this idempotent: Ansible won't re-run the
+# installer if the binary already exists, protecting against accidental
+# double-installs if the play is re-run after a partial success.
+
+- name: "[CATALOG INSTALL] Execute Catalog installer"
+  ansible.builtin.command:
+    cmd: >-
+      {{ catalog_extracted_dir }}/{{ catalog_installer_script }}
+      --standalone-full
+      --install-dir {{ catalog_install_dir }}
+      --data-dir    {{ catalog_data_dir }}
+      --log-dir     {{ catalog_log_dir }}
+      --service-user {{ catalog_system_user }}
+      --config      {{ catalog_extracted_dir }}/system.yaml
+    creates: "{{ catalog_install_dir }}/app/bin/catalog"
+  become_user: root
+  register: catalog_install_result
+  notify:
+    - Reload systemd daemon
+    - Start Catalog service
+
+- name: "[CATALOG INSTALL] Display installer output"
+  ansible.builtin.debug:
+    var: catalog_install_result.stdout_lines
+  when: catalog_install_result.stdout_lines is defined
+
+# ── 5. Post-install permission hardening ──────────────────────────────────────
+# Tighten permissions on the configuration directory so that only the catalog
+# service account (and root) can read connection strings and credentials.
+
+- name: "[CATALOG INSTALL] Restrict permissions on Catalog config directory"
+  ansible.builtin.file:
+    path: "{{ catalog_install_dir }}/var/etc"
+    state: directory
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "0750"
+    recurse: false
+
+- name: "[CATALOG INSTALL] Restrict permissions on Catalog secrets directory"
+  ansible.builtin.file:
+    path: "{{ catalog_install_dir }}/var/etc/security"
+    state: directory
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "0700"
+    recurse: false
+
+# ── 6. Post-install verification ──────────────────────────────────────────────
+
+- name: "[CATALOG INSTALL] Verify Catalog binary exists after installation"
+  ansible.builtin.stat:
+    path: "{{ catalog_install_dir }}/app/bin/catalog"
+  register: catalog_bin_stat_post
+  failed_when: not catalog_bin_stat_post.stat.exists
+
+- name: "[CATALOG INSTALL] Confirm installed version"
+  ansible.builtin.command:
+    cmd: "{{ catalog_install_dir }}/app/bin/catalog --version"
+  register: catalog_version_confirm
+  changed_when: false
+
+- name: "[CATALOG INSTALL] Display confirmed version"
+  ansible.builtin.debug:
+    msg: "✔ JFrog Catalog installed: {{ catalog_version_confirm.stdout | trim }}"

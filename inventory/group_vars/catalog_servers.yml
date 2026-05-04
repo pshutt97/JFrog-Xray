@@ -1,0 +1,81 @@
+---
+# =============================================================================
+# Group-level variables for [catalog_servers]
+# These layer on top of role defaults and can be overridden per-host in
+# inventory/host_vars/<hostname>.yml or at the CLI with -e.
+# =============================================================================
+
+# --- Version & action ---
+catalog_version: "1.5.0"
+catalog_action: "install"        # install | upgrade | configure
+
+# --- Installation paths ---
+catalog_install_dir: /opt/jfrog/catalog
+catalog_data_dir: /var/opt/jfrog/catalog
+catalog_log_dir: /var/log/jfrog/catalog
+catalog_installer_dir: /opt/jfrog/installers
+
+# --- JFrog Platform (Artifactory) connectivity ---
+# Catalog must be joined to the same JFrog Platform Deployment as Xray.
+jfrog_platform_url: "https://artifactory.example.com"
+jfrog_platform_admin_user: "admin"
+# Store the admin token in Ansible Vault – never in plain text!
+# jfrog_platform_admin_token: "{{ vault_jfrog_admin_token }}"
+
+# --- Database (PostgreSQL) ---
+# Catalog uses its own database; it should NOT share the Xray DB.
+catalog_db_type: "postgresql"
+catalog_db_host: "postgres.example.com"
+catalog_db_port: 5432
+catalog_db_name: "catalogdb"
+catalog_db_user: "catalog"
+# Store password in Ansible Vault:
+# catalog_db_password: "{{ vault_catalog_db_password }}"
+
+# --- Network ---
+catalog_http_port: 8082
+catalog_router_port: 8049
+catalog_grpc_port: 7788
+
+# --- System resource limits (Catalog is lighter than Xray) ---
+catalog_open_files_limit: 16000
+catalog_max_map_count: 262144
+
+# --- Systemd service name ---
+catalog_service_name: "catalog"
+
+# --- Download configuration ---
+catalog_use_local_mirror: false
+catalog_local_mirror_base_url: "https://artifactory.example.com/artifactory/jfrog-installers"
+
+# --- Upgrade behaviour ---
+catalog_upgrade_backup: true
+catalog_upgrade_backup_dir: /opt/jfrog/backups
+catalog_upgrade_drain_timeout: 60      # Catalog drains faster than Xray
+
+# --- Security ---
+catalog_create_system_user: true
+catalog_system_user: catalog
+catalog_system_group: catalog
+catalog_system_user_uid: 1051          # Use a UID distinct from the xray user (1050)
+catalog_system_user_gid: 1051
+catalog_system_user_shell: /sbin/nologin
+
+# --- SELinux & firewall ---
+catalog_configure_selinux: true
+catalog_configure_firewall: true
+catalog_firewall_zone: "public"
+
+# --- Proxy (optional) ---
+catalog_http_proxy: ""
+catalog_https_proxy: ""
+catalog_no_proxy: "localhost,127.0.0.1,.example.com"
+
+# --- Catalog-specific feature flags ---
+# Controls whether Catalog syncs curated package metadata from JFrog's
+# upstream security/metadata service.
+catalog_enable_metadata_sync: true
+
+# Controls whether Catalog enforces curation policies (block/warn on
+# non-compliant packages). Set to false in read-only / audit-only deployments.
+catalog_enable_curation_policies: true

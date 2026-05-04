@@ -1,16 +1,29 @@
 ---
 # =============================================================================
-# JFrog Xray – Site-level entry playbook
+# JFrog Platform Services – Site-level entry playbook
+# Manages: JFrog Xray  |  JFrog Catalog
 # =============================================================================
-# Usage:
-#   Install  : ansible-playbook site.yml -e "xray_action=install"
-#   Upgrade  : ansible-playbook site.yml -e "xray_action=upgrade"
-#   Configure: ansible-playbook site.yml -e "xray_action=configure"
 #
-# Override any defaults from roles/xray/defaults/main.yml at the CLI:
-#   ansible-playbook site.yml -e "xray_version=3.88.9 xray_action=upgrade"
+# Usage – Xray:
+#   Install : ansible-playbook site.yml -t xray  -e "xray_action=install"
+#   Upgrade : ansible-playbook site.yml -t xray  -e "xray_action=upgrade  xray_version=3.91.0"
+#   Config  : ansible-playbook site.yml -t xray  -e "xray_action=configure"
+#
+# Usage – Catalog:
+#   Install : ansible-playbook site.yml -t catalog -e "catalog_action=install"
+#   Upgrade : ansible-playbook site.yml -t catalog -e "catalog_action=upgrade catalog_version=1.5.0"
+#   Config  : ansible-playbook site.yml -t catalog -e "catalog_action=configure"
+#
+# Usage – Both services together:
+#   ansible-playbook site.yml \
+#     -e "xray_action=upgrade    xray_version=3.91.0" \
+#     -e "catalog_action=upgrade catalog_version=1.5.0"
+#
+# NOTE: xray_servers and catalog_servers can overlap (same VMs) or be
+#       completely separate host groups – the inventory controls this.
 # =============================================================================
 
+# ── Controller sanity check (runs once, before any host is touched) ──────────
 - name: Validate controller prerequisites
   hosts: localhost
   gather_facts: false
@@ -31,18 +44,29 @@
       vars:
         xray_action: "{{ xray_action | default('install') }}"
 
+    - name: Assert a valid catalog_action was provided
+      ansible.builtin.assert:
+        that: catalog_action in ['install', 'upgrade', 'configure']
+        fail_msg: >-
+          Invalid catalog_action='{{ catalog_action | default('undefined') }}'.
+          Must be one of: install, upgrade, configure.
+      vars:
+        catalog_action: "{{ catalog_action | default('install') }}"
+
+# ── Play 1: JFrog Xray ───────────────────────────────────────────────────────
 - name: JFrog Xray – provision target hosts
   hosts: xray_servers
   become: true
   gather_facts: true
-  any_errors_fatal: false    # Allows other hosts to proceed if one fails
-  serial: "{{ xray_serial | default('1') }}"   # Rolling upgrade safety
+  any_errors_fatal: false
+  serial: "{{ xray_serial | default('1') }}"
+  tags: [xray]
 
   vars:
     xray_action: "{{ xray_action | default('install') }}"
 
   pre_tasks:
-    - name: Verify target OS is RHEL / Rocky / AlmaLinux 9
+    - name: "[XRAY] Verify target OS is RHEL / Rocky / AlmaLinux 9"
       ansible.builtin.assert:
         that:
           - ansible_os_family == "RedHat"
@@ -51,32 +75,82 @@
           Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_version }}.
           This playbook targets RHEL-family 9.x only.
         success_msg: "OS check passed: {{ ansible_distribution }} {{ ansible_distribution_version }}"
-      tags: [always, preflight]
+      tags: [preflight]
 
-    - name: Collect pre-run Xray service state (if present)
+    - name: "[XRAY] Collect pre-run service state"
       ansible.builtin.systemd:
         name: "{{ xray_service_name }}"
       register: xray_pre_state
       failed_when: false
       changed_when: false
-      tags: [always]
 
   roles:
     - role: xray
       tags: [xray]
 
   post_tasks:
-    - name: Confirm Xray service is active after provisioning
+    - name: "[XRAY] Confirm service is active after provisioning"
       ansible.builtin.systemd:
         name: "{{ xray_service_name }}"
       register: xray_post_state
       failed_when: xray_post_state.status.ActiveState != 'active'
       changed_when: false
-      tags: [always, validate]
+      tags: [validate]
 
-    - name: Display final service status
+    - name: "[XRAY] Display final service status"
       ansible.builtin.debug:
         msg: >-
           ✔ JFrog Xray {{ xray_version }} is {{ xray_post_state.status.ActiveState }}
           on {{ inventory_hostname }}.
-      tags: [always, validate]
+      tags: [validate]
+
+# ── Play 2: JFrog Catalog ────────────────────────────────────────────────────
+- name: JFrog Catalog – provision target hosts
+  hosts: catalog_servers
+  become: true
+  gather_facts: true
+  any_errors_fatal: false
+  serial: "{{ catalog_serial | default('1') }}"
+  tags: [catalog]
+
+  vars:
+    catalog_action: "{{ catalog_action | default('install') }}"
+
+  pre_tasks:
+    - name: "[CATALOG] Verify target OS is RHEL / Rocky / AlmaLinux 9"
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "RedHat"
+          - ansible_distribution_major_version == "9"
+        fail_msg: >-
+          Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+          This playbook targets RHEL-family 9.x only.
+        success_msg: "OS check passed: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+      tags: [preflight]
+
+    - name: "[CATALOG] Collect pre-run service state"
+      ansible.builtin.systemd:
+        name: "{{ catalog_service_name }}"
+      register: catalog_pre_state
+      failed_when: false
+      changed_when: false
+
+  roles:
+    - role: catalog
+      tags: [catalog]
+
+  post_tasks:
+    - name: "[CATALOG] Confirm service is active after provisioning"
+      ansible.builtin.systemd:
+        name: "{{ catalog_service_name }}"
+      register: catalog_post_state
+      failed_when: catalog_post_state.status.ActiveState != 'active'
+      changed_when: false
+      tags: [validate]
+
+    - name: "[CATALOG] Display final service status"
+      ansible.builtin.debug:
+        msg: >-
+          ✔ JFrog Catalog {{ catalog_version }} is {{ catalog_post_state.status.ActiveState }}
+          on {{ inventory_hostname }}.
+      tags: [validate]

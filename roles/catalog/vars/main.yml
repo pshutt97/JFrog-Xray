@@ -1,0 +1,74 @@
+---
+# =============================================================================
+# roles/catalog/vars/main.yml
+# Internal "constants" for the catalog role. Higher precedence than defaults,
+# but generally not meant to be overridden externally. Think of these as the
+# role's private implementation details — things that describe how the role
+# works rather than what the operator wants to configure.
+# =============================================================================
+
+# Minimum hardware requirements validated during preflight.
+# Catalog is significantly lighter than Xray — it doesn't run an embedded
+# search engine or deep binary scanner, so 2 vCPUs / 4 GB is viable for
+# small deployments. Scale up for high-throughput curation environments.
+catalog_min_cpu_count: 2
+catalog_min_ram_mb: 4096      # 4 GB minimum; 8 GB recommended for production
+
+# Required OS packages — same baseline as Xray, since both are JFrog Platform
+# services running on the same RHEL 9 stack.
+catalog_required_packages:
+  - curl
+  - wget
+  - tar
+  - gzip
+  - net-tools
+  - lsof
+  - openssl
+  - ca-certificates
+  - policycoreutils-python-utils   # semanage, for SELinux context management
+  - firewalld
+
+# SELinux file contexts applied to Catalog-managed directories.
+# These mirror the Xray patterns — bin_t for executables, var_t for runtime
+# data, var_log_t for logs — which are well-understood by the SELinux policy.
+catalog_selinux_fcontexts:
+  - { path: "{{ catalog_install_dir }}(/.*)?", type: "bin_t" }
+  - { path: "{{ catalog_data_dir }}(/.*)?",    type: "var_t" }
+  - { path: "{{ catalog_log_dir }}(/.*)?",     type: "var_log_t" }
+
+# Systemd drop-in directory for resource limit overrides. Using a drop-in
+# rather than modifying the main unit file means upgrades can replace the
+# unit file without clobbering our tuning.
+catalog_systemd_dropin_dir: "/etc/systemd/system/{{ catalog_service_name }}.service.d"
+
+# Installer script names inside the extracted tarball.
+catalog_installer_script: "installCatalog.sh"
+catalog_installer_upgrade_script: "upgradeCatalog.sh"
+
+# Derived download URL — assembled from the base URL and version.
+# When xray_use_local_mirror is true the local base URL is used instead,
+# which is essential for air-gapped environments.
+_catalog_download_url_default: >-
+  {{ catalog_download_base_url }}/{{ catalog_version }}/{{ catalog_installer_archive }}
+
+catalog_download_url: >-
+  {{
+    (catalog_local_mirror_base_url ~ '/' ~ catalog_installer_archive)
+    if catalog_use_local_mirror
+    else _catalog_download_url_default | trim
+  }}
+
+# Complete map of directories the role must own. Centralising this here means
+# system_prep.yml, configure.yml, and the SELinux tasks all refer to the same
+# source of truth rather than duplicating path strings.
+catalog_managed_directories:
+  - path: "{{ catalog_install_dir }}"
+    mode: "0755"
+  - path: "{{ catalog_data_dir }}"
+    mode: "0750"
+  - path: "{{ catalog_log_dir }}"
+    mode: "0750"
+  - path: "{{ catalog_installer_dir }}"
+    mode: "0755"
+  - path: "{{ catalog_upgrade_backup_dir }}"
+    mode: "0750"

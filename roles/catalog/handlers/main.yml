@@ -1,0 +1,44 @@
+---
+# =============================================================================
+# roles/catalog/handlers/main.yml
+# Handlers are idempotent event-driven responders — they fire at most once per
+# play, regardless of how many tasks notify them. This prevents redundant
+# service restarts when multiple configuration files change in the same run.
+#
+# The handler names here deliberately mirror the Xray handler names in style
+# (verb + noun) but are kept in the catalog role's own handlers/main.yml so
+# there is no cross-role dependency or namespace collision.
+# =============================================================================
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+  listen: Reload systemd daemon
+
+- name: Start Catalog service
+  ansible.builtin.systemd:
+    name: "{{ catalog_service_name }}"
+    state: started
+    enabled: true
+  listen: Start Catalog service
+
+- name: Restart Catalog service
+  ansible.builtin.systemd:
+    name: "{{ catalog_service_name }}"
+    state: restarted
+    enabled: true
+  listen: Restart Catalog service
+
+# restorecon applies the SELinux file context rules registered by the
+# sefcontext tasks in system_prep.yml. Running it here (as a handler,
+# triggered only when contexts actually changed) avoids the overhead of
+# a full recursive restorecon on every play run.
+- name: Restore SELinux file contexts
+  ansible.builtin.command:
+    cmd: >-
+      restorecon -Rv
+      {{ catalog_install_dir }}
+      {{ catalog_data_dir }}
+      {{ catalog_log_dir }}
+  changed_when: true
+  listen: Restore SELinux file contexts

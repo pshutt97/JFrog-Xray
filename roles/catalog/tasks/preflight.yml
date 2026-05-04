@@ -1,0 +1,159 @@
+---
+# =============================================================================
+# roles/catalog/tasks/preflight.yml
+# Pre-flight validation for JFrog Catalog. Runs before any system state is
+# modified, so failures are caught early and cleanly — no half-applied changes.
+#
+# The checks mirror the Xray preflight intentionally: same port-conflict
+# detection pattern, same install/upgrade mutual-exclusivity guards, same
+# connectivity verification approach. Consistency makes the suite predictable.
+# =============================================================================
+
+# ── 1. Hardware ───────────────────────────────────────────────────────────────
+
+- name: "[CATALOG PREFLIGHT] Assert minimum CPU count"
+  ansible.builtin.assert:
+    that: ansible_processor_vcpus >= catalog_min_cpu_count
+    fail_msg: >-
+      Insufficient vCPUs: {{ ansible_processor_vcpus }} detected,
+      {{ catalog_min_cpu_count }} required for JFrog Catalog.
+    success_msg: "CPU check passed: {{ ansible_processor_vcpus }} vCPUs available."
+
+- name: "[CATALOG PREFLIGHT] Assert minimum RAM"
+  ansible.builtin.assert:
+    that: ansible_memtotal_mb >= catalog_min_ram_mb
+    fail_msg: >-
+      Insufficient RAM: {{ ansible_memtotal_mb }} MB detected,
+      {{ catalog_min_ram_mb }} MB required for JFrog Catalog.
+    success_msg: "RAM check passed: {{ ansible_memtotal_mb }} MB available."
+
+- name: "[CATALOG PREFLIGHT] Assert sufficient disk space on install dir parent"
+  ansible.builtin.assert:
+    that: >-
+      (ansible_mounts
+        | selectattr('mount', 'in', [catalog_install_dir, '/opt', '/'])
+        | map(attribute='size_available')
+        | list | first | default(0)) >= 5368709120
+    fail_msg: >-
+      Insufficient disk space on the mount hosting {{ catalog_install_dir }}.
+      At least 5 GB free is required.
+    success_msg: "Disk space check passed."
+
+# ── 2. Port availability (install only — Catalog already owns these on upgrade) ─
+
+- name: "[CATALOG PREFLIGHT] Check required ports are not already bound"
+  ansible.builtin.wait_for:
+    port: "{{ item }}"
+    state: stopped
+    timeout: 5
+  loop:
+    - "{{ catalog_http_port }}"
+    - "{{ catalog_grpc_port }}"
+    - "{{ catalog_router_port }}"
+  when: catalog_action == 'install'
+
+# ── 3. External service connectivity ─────────────────────────────────────────
+# Catalog must be able to reach Artifactory (to join the JFrog Platform) and
+# its database at deploy time. Failing here with a clear message is far
+# friendlier than failing deep inside the installer script with an opaque error.
+
+- name: "[CATALOG PREFLIGHT] Verify JFrog Platform (Artifactory) is reachable"
+  ansible.builtin.uri:
+    url: "{{ jfrog_platform_url }}/artifactory/api/system/ping"
+    method: GET
+    status_code: 200
+    timeout: 15
+    validate_certs: true
+  register: artifactory_ping
+  retries: 3
+  delay: 10
+  until: artifactory_ping.status == 200
+  failed_when: artifactory_ping.status != 200
+
+- name: "[CATALOG PREFLIGHT] Verify database host is reachable"
+  ansible.builtin.wait_for:
+    host: "{{ catalog_db_host }}"
+    port: "{{ catalog_db_port }}"
+    state: started
+    timeout: 10
+  when: catalog_db_host != 'localhost'
+
+# ── 4. Existing installation detection ───────────────────────────────────────
+# We check for the Catalog binary (rather than the install directory, which
+# may already exist due to system_prep.yml creating it) so the detection is
+# unambiguous even if the directory was pre-created manually.
+
+- name: "[CATALOG PREFLIGHT] Detect existing Catalog installation"
+  ansible.builtin.stat:
+    path: "{{ catalog_install_dir }}/app/bin/catalog"
+  register: catalog_binary_stat
+
+- name: "[CATALOG PREFLIGHT] Determine installed Catalog version (if any)"
+  ansible.builtin.command:
+    cmd: "{{ catalog_install_dir }}/app/bin/catalog --version"
+  register: catalog_installed_version_raw
+  changed_when: false
+  failed_when: false
+  when: catalog_binary_stat.stat.exists
+
+- name: "[CATALOG PREFLIGHT] Set installed_version fact (Catalog present)"
+  ansible.builtin.set_fact:
+    catalog_installed_version: >-
+      {{ catalog_installed_version_raw.stdout
+         | regex_search('(\d+\.\d+\.\d+)')
+         | default('none') }}
+  when: catalog_binary_stat.stat.exists
+
+- name: "[CATALOG PREFLIGHT] Set installed_version fact (Catalog absent)"
+  ansible.builtin.set_fact:
+    catalog_installed_version: "none"
+  when: not catalog_binary_stat.stat.exists
+
+# ── 5. Action / state mutual-exclusivity guards ───────────────────────────────
+
+- name: "[CATALOG PREFLIGHT] Abort if 'install' requested but Catalog already exists"
+  ansible.builtin.assert:
+    that: not catalog_binary_stat.stat.exists
+    fail_msg: >-
+      Catalog {{ catalog_installed_version }} is already installed at
+      {{ catalog_install_dir }}. Use catalog_action=upgrade to upgrade in place.
+    success_msg: "Install path is clear — no existing Catalog installation detected."
+  when: catalog_action == 'install'
+
+- name: "[CATALOG PREFLIGHT] Abort if 'upgrade' requested but Catalog is NOT installed"
+  ansible.builtin.assert:
+    that: catalog_binary_stat.stat.exists
+    fail_msg: >-
+      catalog_action=upgrade was requested but no Catalog installation was found
+      at {{ catalog_install_dir }}. Run with catalog_action=install first.
+    success_msg: "Existing Catalog installation confirmed at {{ catalog_install_dir }}."
+  when: catalog_action == 'upgrade'
+
+- name: "[CATALOG PREFLIGHT] Warn if target version matches installed version"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠ WARNING: Requested version {{ catalog_version }} matches the currently
+      installed version {{ catalog_installed_version }}. The upgrade will proceed
+      but may be a no-op.
+  when:
+    - catalog_action == 'upgrade'
+    - catalog_installed_version == catalog_version
+
+# ── 6. Summary ───────────────────────────────────────────────────────────────
+
+- name: "[CATALOG PREFLIGHT] Display summary"
+  ansible.builtin.debug:
+    msg:
+      - "=== JFrog Catalog Pre-flight Summary ==="
+      - "Host              : {{ inventory_hostname }}"
+      - "Action            : {{ catalog_action }}"
+      - "Target version    : {{ catalog_version }}"
+      - "Installed version : {{ catalog_installed_version }}"
+      - "vCPUs             : {{ ansible_processor_vcpus }}"
+      - "RAM (MB)          : {{ ansible_memtotal_mb }}"
+      - "Install dir       : {{ catalog_install_dir }}"
+      - "Data dir          : {{ catalog_data_dir }}"
+      - "DB host           : {{ catalog_db_host }}:{{ catalog_db_port }}"
+      - "HTTP port         : {{ catalog_http_port }}"
+      - "gRPC port         : {{ catalog_grpc_port }}"
+      - "Router port       : {{ catalog_router_port }}"

@@ -1,0 +1,174 @@
+---
+# =============================================================================
+# roles/catalog/tasks/system_prep.yml
+# Idempotent system-level preparation for JFrog Catalog.
+#
+# One important design note: if Catalog is co-located on the same VM as Xray,
+# several of these tasks (package install, sysctl, firewalld start) will simply
+# report "ok" on the second role run because they are already satisfied. The
+# tasks that ARE distinct between the two roles — system user/group, directory
+# layout, SELinux contexts, and port registration — use Catalog-specific names
+# and values so there is no collision with the Xray role's resources.
+# =============================================================================
+
+# ── 1. OS packages ────────────────────────────────────────────────────────────
+# Identical package list to Xray. On a co-located VM Ansible's dnf module
+# will simply report "ok" because the packages are already present.
+
+- name: "[CATALOG SYSTEM_PREP] Ensure DNF cache is fresh"
+  ansible.builtin.dnf:
+    update_cache: true
+  changed_when: false
+
+- name: "[CATALOG SYSTEM_PREP] Install required OS packages"
+  ansible.builtin.dnf:
+    name: "{{ catalog_required_packages }}"
+    state: present
+
+# ── 2. System user & group ────────────────────────────────────────────────────
+# The catalog user is intentionally distinct from the xray user (different
+# UID/GID) so file ownership on a co-located host is unambiguous and audit
+# logs can differentiate activity by the two services.
+
+- name: "[CATALOG SYSTEM_PREP] Create catalog system group"
+  ansible.builtin.group:
+    name: "{{ catalog_system_group }}"
+    gid: "{{ catalog_system_user_gid }}"
+    system: true
+    state: present
+  when: catalog_create_system_user
+
+- name: "[CATALOG SYSTEM_PREP] Create catalog system user"
+  ansible.builtin.user:
+    name: "{{ catalog_system_user }}"
+    uid: "{{ catalog_system_user_uid }}"
+    group: "{{ catalog_system_group }}"
+    shell: "{{ catalog_system_user_shell }}"
+    home: "{{ catalog_data_dir }}"
+    create_home: false
+    system: true
+    comment: "JFrog Catalog service account"
+    state: present
+  when: catalog_create_system_user
+
+# ── 3. Directory layout ───────────────────────────────────────────────────────
+
+- name: "[CATALOG SYSTEM_PREP] Create required directories"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ catalog_system_user }}"
+    group: "{{ catalog_system_group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ catalog_managed_directories }}"
+
+# ── 4. Kernel parameters ─────────────────────────────────────────────────────
+# vm.max_map_count is set conservatively here. If Xray is co-located it will
+# have already set this to 262144 (the same value), so sysctl is idempotent.
+
+- name: "[CATALOG SYSTEM_PREP] Set kernel parameters via sysctl"
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-jfrog-catalog.conf
+  loop:
+    - { name: "vm.max_map_count", value: "{{ catalog_max_map_count }}" }
+    - { name: "fs.file-max",      value: "{{ catalog_open_files_limit * 4 }}" }
+
+# ── 5. Systemd resource limits drop-in ───────────────────────────────────────
+
+- name: "[CATALOG SYSTEM_PREP] Create systemd drop-in directory for Catalog"
+  ansible.builtin.file:
+    path: "{{ catalog_systemd_dropin_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "[CATALOG SYSTEM_PREP] Write systemd limits drop-in"
+  ansible.builtin.copy:
+    dest: "{{ catalog_systemd_dropin_dir }}/limits.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible – do not edit manually.
+      [Service]
+      LimitNOFILE={{ catalog_open_files_limit }}
+      LimitNPROC=4096
+      LimitCORE=infinity
+  notify: Reload systemd daemon
+
+# ── 6. PAM limits (fallback) ──────────────────────────────────────────────────
+
+- name: "[CATALOG SYSTEM_PREP] Set PAM open-files limits for catalog user"
+  community.general.pam_limits:
+    domain: "{{ catalog_system_user }}"
+    limit_type: "{{ item.type }}"
+    limit_item: nofile
+    value: "{{ catalog_open_files_limit }}"
+  loop:
+    - { type: soft }
+    - { type: hard }
+
+# ── 7. SELinux ────────────────────────────────────────────────────────────────
+
+- name: "[CATALOG SYSTEM_PREP] Apply SELinux file contexts for Catalog directories"
+  community.general.sefcontext:
+    target: "{{ item.path }}"
+    setype: "{{ item.type }}"
+    state: present
+  loop: "{{ catalog_selinux_fcontexts }}"
+  when: catalog_configure_selinux
+  notify: Restore SELinux file contexts
+
+- name: "[CATALOG SYSTEM_PREP] Set required SELinux booleans"
+  ansible.posix.seboolean:
+    name: "{{ item }}"
+    state: true
+    persistent: true
+  loop:
+    - httpd_can_network_connect
+    - nis_enabled
+  when: catalog_configure_selinux
+
+# ── 8. Firewalld ──────────────────────────────────────────────────────────────
+# On a co-located host firewalld is already running (started by the Xray role).
+# The systemd module is idempotent so this is safe to repeat.
+
+- name: "[CATALOG SYSTEM_PREP] Ensure firewalld is started and enabled"
+  ansible.builtin.service:
+    name: firewalld
+    state: started
+    enabled: true
+  when: catalog_configure_firewall
+
+- name: "[CATALOG SYSTEM_PREP] Open Catalog ports in firewalld"
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    zone: "{{ catalog_firewall_zone }}"
+    state: enabled
+    permanent: true
+    immediate: true
+  loop:
+    - "{{ catalog_http_port }}"
+    - "{{ catalog_grpc_port }}"
+    - "{{ catalog_router_port }}"
+  when: catalog_configure_firewall
+
+# ── 9. Proxy environment ──────────────────────────────────────────────────────
+
+- name: "[CATALOG SYSTEM_PREP] Configure system-wide proxy environment file"
+  ansible.builtin.blockinfile:
+    path: /etc/environment
+    marker: "# {mark} ANSIBLE MANAGED – JFrog Catalog proxy settings"
+    block: |
+      HTTP_PROXY={{ catalog_http_proxy }}
+      HTTPS_PROXY={{ catalog_https_proxy }}
+      NO_PROXY={{ catalog_no_proxy }}
+      http_proxy={{ catalog_http_proxy }}
+      https_proxy={{ catalog_https_proxy }}
+      no_proxy={{ catalog_no_proxy }}
+    state: "{{ 'present' if catalog_http_proxy else 'absent' }}"

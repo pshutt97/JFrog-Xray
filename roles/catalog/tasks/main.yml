@@ -1,0 +1,45 @@
+---
+# =============================================================================
+# roles/catalog/tasks/main.yml
+# Orchestration entry point — routes execution through the logical dependency
+# chain: preflight → system prep → install OR upgrade → configure → service.
+#
+# The separation into discrete sub-task files serves two purposes:
+#   1. Each file has a single responsibility, making it easy to test or
+#      re-run just one phase (e.g., `--tags configure` to converge config
+#      drift without touching the binary).
+#   2. The action routing guard (install vs. upgrade) is explicit and
+#      auditable at a glance, rather than buried in conditional task logic.
+# =============================================================================
+
+- name: Run preflight checks
+  ansible.builtin.import_tasks: preflight.yml
+  tags: [catalog, preflight]
+
+- name: Prepare system (users, dirs, packages, OS tuning)
+  ansible.builtin.import_tasks: system_prep.yml
+  tags: [catalog, system_prep]
+
+# ── Action routing ─────────────────────────────────────────────────────────
+# Only one of these two blocks executes per run, determined by catalog_action.
+# The preflight.yml task file enforces mutual exclusivity: if Catalog is
+# already installed you cannot pass catalog_action=install, and vice versa.
+
+- name: Execute INSTALL workflow
+  ansible.builtin.import_tasks: install.yml
+  when: catalog_action == 'install'
+  tags: [catalog, install]
+
+- name: Execute UPGRADE workflow
+  ansible.builtin.import_tasks: upgrade.yml
+  when: catalog_action == 'upgrade'
+  tags: [catalog, upgrade]
+# ──────────────────────────────────────────────────────────────────────────
+
+- name: Apply Catalog configuration
+  ansible.builtin.import_tasks: configure.yml
+  tags: [catalog, configure]
+
+- name: Manage Catalog systemd service
+  ansible.builtin.import_tasks: service.yml
+  tags: [catalog, service]

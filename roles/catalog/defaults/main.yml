@@ -1,0 +1,80 @@
+---
+# =============================================================================
+# roles/catalog/defaults/main.yml
+# Lowest-precedence defaults for the catalog role. Safe to override at any
+# higher level (group_vars, host_vars, -e CLI flags).
+# =============================================================================
+
+# --- Core version & action ---
+catalog_version: "1.5.0"
+catalog_action: "install"
+
+# --- Filesystem layout ---
+catalog_install_dir: /opt/jfrog/catalog
+catalog_data_dir: /var/opt/jfrog/catalog
+catalog_log_dir: /var/log/jfrog/catalog
+catalog_installer_dir: /opt/jfrog/installers
+catalog_upgrade_backup_dir: /opt/jfrog/backups
+
+# --- Service name (matches systemd unit) ---
+catalog_service_name: catalog
+
+# --- System user/group ---
+catalog_create_system_user: true
+catalog_system_user: catalog
+catalog_system_group: catalog
+catalog_system_user_uid: 1051
+catalog_system_user_gid: 1051
+catalog_system_user_shell: /sbin/nologin
+
+# --- Network ports ---
+catalog_http_port: 8082
+catalog_router_port: 8049
+catalog_grpc_port: 7788
+
+# --- OS tuning ---
+catalog_open_files_limit: 16000
+catalog_max_map_count: 262144
+
+# --- Database ---
+catalog_db_type: "postgresql"
+catalog_db_host: "localhost"
+catalog_db_port: 5432
+catalog_db_name: "catalogdb"
+catalog_db_user: "catalog"
+catalog_db_password: "changeme"   # Always override via Vault in production!
+
+# --- JFrog Platform (Artifactory) ---
+jfrog_platform_url: "https://artifactory.example.com"
+jfrog_platform_admin_user: "admin"
+jfrog_platform_admin_token: ""
+
+# --- Download source ---
+catalog_download_base_url: "https://releases.jfrog.io/artifactory/jfrog-catalog"
+catalog_use_local_mirror: false
+catalog_local_mirror_base_url: ""
+catalog_installer_checksum_algo: "sha256"
+
+# --- Installer archive name (resolved at runtime) ---
+catalog_installer_archive: "catalog-{{ catalog_version }}-linux.tar.gz"
+
+# --- Upgrade settings ---
+catalog_upgrade_backup: true
+catalog_upgrade_drain_timeout: 60
+
+# --- Proxy ---
+catalog_http_proxy: ""
+catalog_https_proxy: ""
+catalog_no_proxy: "localhost,127.0.0.1"
+
+# --- SELinux & firewall ---
+catalog_configure_selinux: true
+catalog_configure_firewall: true
+catalog_firewall_zone: "public"
+
+# --- Features ---
+catalog_enable_metadata_sync: true
+catalog_enable_curation_policies: true
+
+# --- Catalog node identification (auto-derived from inventory_hostname if unset) ---
+# catalog_node_id: ""

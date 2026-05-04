@@ -1,0 +1,89 @@
+---
+# =============================================================================
+# roles/catalog/tasks/service.yml
+# Ensures the Catalog systemd service is correctly enabled, started, and
+# serving traffic. This is always the last task file to run, acting as the
+# definitive "done" signal for both install and upgrade workflows.
+#
+# The three-stage health check (flush handlers → HTTP ping → port assertions)
+# mirrors the Xray service.yml pattern exactly, so both services are verified
+# with the same degree of rigour before the play reports success.
+# =============================================================================
+
+# ── 1. Flush pending handlers ─────────────────────────────────────────────────
+# Any restart/reload notifications queued by configure.yml (e.g., a config
+# file was updated) are flushed here so that the service is in its final
+# desired state before we start polling the health endpoint. Without this,
+# we could accidentally poll a service that is about to be restarted.
+
+- name: "[CATALOG SERVICE] Flush handlers before health check"
+  ansible.builtin.meta: flush_handlers
+
+# ── 2. Enable and start ───────────────────────────────────────────────────────
+# Using 'state: started' rather than 'state: restarted' is intentional —
+# if the service is already running (e.g., after a configure-only run where
+# no config changed), this is a no-op and avoids an unnecessary restart.
+
+- name: "[CATALOG SERVICE] Enable and start Catalog systemd service"
+  ansible.builtin.systemd:
+    name: "{{ catalog_service_name }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+# ── 3. HTTP health check ──────────────────────────────────────────────────────
+# Catalog's /api/v1/system/ping endpoint returns HTTP 200 once the service,
+# database connection, and platform join handshake are all operational.
+# We retry for up to 3 minutes (18 × 10 s) — enough for the JVM to warm up
+# and the initial Artifactory platform registration to complete.
+
+- name: "[CATALOG SERVICE] Wait for Catalog HTTP ping to return 200"
+  ansible.builtin.uri:
+    url: "http://localhost:{{ catalog_http_port }}/api/v1/system/ping"
+    method: GET
+    status_code: 200
+    timeout: 10
+    return_content: true
+  register: catalog_health
+  retries: 18
+  delay: 10
+  until: catalog_health.status == 200
+  failed_when: catalog_health.status != 200
+
+# ── 4. Port assertions ────────────────────────────────────────────────────────
+# Belt-and-suspenders check: even if the HTTP ping passed, we confirm the
+# gRPC and router ports are also listening, since those are the interfaces
+# that Artifactory and other JFrog services use to communicate with Catalog.
+
+- name: "[CATALOG SERVICE] Confirm gRPC port is listening"
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ catalog_grpc_port }}"
+    state: started
+    timeout: 30
+
+- name: "[CATALOG SERVICE] Confirm router port is listening"
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ catalog_router_port }}"
+    state: started
+    timeout: 30
+
+# ── 5. Service state report ───────────────────────────────────────────────────
+
+- name: "[CATALOG SERVICE] Collect final systemd unit status"
+  ansible.builtin.command:
+    cmd: "systemctl status {{ catalog_service_name }}"
+  register: catalog_unit_status
+  changed_when: false
+  failed_when: false
+
+- name: "[CATALOG SERVICE] Display service status summary"
+  ansible.builtin.debug:
+    msg:
+      - "=== Catalog Service Health ==="
+      - "HTTP ping   : {{ catalog_health.status }} {{ catalog_health.content | default('') }}"
+      - "systemd     : {{ catalog_unit_status.stdout_lines[2] | default('N/A') | trim }}"
+      - "HTTP port   : {{ catalog_http_port }} – OPEN"
+      - "gRPC port   : {{ catalog_grpc_port }} – OPEN"
+      - "Router port : {{ catalog_router_port }} – OPEN"

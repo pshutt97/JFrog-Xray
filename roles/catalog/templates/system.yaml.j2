@@ -1,0 +1,77 @@
+{# =============================================================================
+   roles/catalog/templates/system.yaml.j2
+   JFrog Platform system.yaml for JFrog Catalog.
+
+   This file is the primary configuration consumed by both the JFrog
+   installer/upgrader scripts and the running Catalog process. Its schema
+   is the same across all JFrog Platform services (Xray, Catalog, etc.),
+   which is why a very similar template exists in the xray role — the
+   differences are the service-specific port numbers and section names.
+
+   Managed by Ansible – {{ ansible_date_time.iso8601 }}
+   Host: {{ inventory_hostname }}
+   ============================================================================= #}
+
+## ============================================================
+## JFrog Catalog – system.yaml
+## Host    : {{ inventory_hostname }}
+## Version : {{ catalog_version }}
+## ============================================================
+
+shared:
+  # ── JFrog Platform node identity ──────────────────────────────────────────
+  # The node ID must be unique within the JFrog Platform deployment.
+  # We default to a sanitised form of inventory_hostname so it is
+  # automatically distinct in a multi-node inventory without manual overrides.
+  node:
+    id: "{{ catalog_node_id | default(inventory_hostname | replace('.', '-')) }}"
+
+  # ── Database ───────────────────────────────────────────────────────────────
+  # Catalog requires its own database schema — it must NOT share the same
+  # database or schema used by Xray. Using the same PostgreSQL server
+  # (different db_name) is fine and common in smaller deployments.
+  database:
+    type: "{{ catalog_db_type }}"
+    driver: >-
+      {% if catalog_db_type == 'postgresql' %}org.postgresql.Driver
+      {% elif catalog_db_type == 'mysql' %}com.mysql.jdbc.Driver
+      {% else %}org.postgresql.Driver{% endif %}
+    url: >-
+      {% if catalog_db_type == 'postgresql' %}
+      postgres://{{ catalog_db_user }}:{{ catalog_db_password }}@{{ catalog_db_host }}:{{ catalog_db_port }}/{{ catalog_db_name }}?sslmode=disable
+      {% endif %}
+    username: "{{ catalog_db_user }}"
+    password: "{{ catalog_db_password }}"
+
+  # ── JFrog Platform join ────────────────────────────────────────────────────
+  # Catalog must be joined to the same Artifactory-backed JFrog Platform
+  # Deployment (JPD) as Xray. The platform URL points to Artifactory.
+  jfrogUrl: "{{ jfrog_platform_url }}"
+
+{% if catalog_http_proxy %}
+  # ── Proxy ──────────────────────────────────────────────────────────────────
+  proxy:
+    http:    "{{ catalog_http_proxy }}"
+    https:   "{{ catalog_https_proxy }}"
+    noProxy: "{{ catalog_no_proxy }}"
+{% endif %}
+
+# ── Catalog-specific section ──────────────────────────────────────────────────
+catalog:
+  # HTTP API port — used by the Artifactory UI and external API clients
+  port: {{ catalog_http_port }}
+
+  # Router (Access) port — internal JFrog Platform inter-service communication
+  router:
+    port: {{ catalog_router_port }}
+
+  # gRPC port — used for high-throughput internal RPC between platform services
+  grpc:
+    port: {{ catalog_grpc_port }}
+
+  # Filesystem paths — must match the values passed to the installer/upgrader
+  # so that the running service and the install tooling agree on where
+  # configuration, data, and logs live.
+  installDir: "{{ catalog_install_dir }}"
+  dataDir:    "{{ catalog_data_dir }}"
+  logDir:     "{{ catalog_log_dir }}"
